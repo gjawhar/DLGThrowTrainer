@@ -1,0 +1,4 @@
+# Runtime data written by the widget on the radio (per-install, not source)
+ThrowTrn/Files/*.csv
+
+.DS_Store
