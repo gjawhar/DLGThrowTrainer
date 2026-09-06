@@ -4,7 +4,7 @@
 
 local core = {}
 
-core.VERSION = "1.1.0"
+core.VERSION = "1.1.1"
 
 -- ---------------------------------------------------------------- constants
 
@@ -687,19 +687,21 @@ end
 -- (so UNDO can't pick a seed row apart one at a time -- Erase or a real
 -- throw are the only ways out), and refuses to run over an existing real
 -- log rather than silently discarding it.
-function core.seedDemo(n, height)
+function core.seedDemo(n, minHeight, maxHeight)
   if #S.launches > 0 then
     core.setStatus("erase real data first")
     return false
   end
   n = n or 10
-  height = height or 50
+  minHeight = minHeight or 60
+  maxHeight = maxHeight or 95
   local gid = S.gid
   local base = os.time()
 
   for i = 1, n do
     S.seq = S.seq + 1
     local ts = base - (n - i)
+    local height = math.random(minHeight, maxHeight)
     S.launches[#S.launches + 1] = {
       ts = ts, h = height, u = S.unit, grp = 1, st = "ok",
       seed = true, seq = S.seq,
@@ -707,7 +709,8 @@ function core.seedDemo(n, height)
     appendRow("launches", { tostring(ts), gid, tostring(height), S.unit,
                             "1", "ok", "1" })
   end
-  core.setStatus(string.format("seeded %d sample throws at %d %s", n, height, S.unit))
+  core.setStatus(string.format("seeded %d sample throws from %d-%d %s",
+    n, minHeight, maxHeight, S.unit))
   return true
 end
 

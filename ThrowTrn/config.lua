@@ -85,11 +85,11 @@ function config.build(onErase, onDone)
     string.format("%d throws, %d changes", nL, nC))
 
   line = panel:addLine("Seed sample data")
-  form.addButton(line, nil, { text = "Seed 10 @ 50", press = function()
-    core.seedDemo(10, 50)
+  form.addButton(line, nil, { text = "Seed 10 @ 60-95", press = function()
+    core.seedDemo(10, 60, 95)
   end })
 
-  line = panel:addLine("Erase this glider")
+  line = panel:addLine("Erase this glider's data")
   form.addButton(line, nil, { text = "Erase...", press = function()
     if onErase then onErase() end
   end })
