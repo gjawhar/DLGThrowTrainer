@@ -34,9 +34,9 @@ the workaround (use the on-screen soft keys instead of a physical switch).
 
 ### Install with Ethos Suite
 
-1. Prepare a ZIP file that contains the final SD card folder structure
-   directly: the archive's top-level path should be `scripts/ThrowTrn/...`,
-   not wrapped in an extra parent folder.
+1. Prepare a ZIP file that contains the final folder structure directly:
+   the archive's top-level path should be `scripts/ThrowTrn/...`, not
+   wrapped in an extra parent folder.
 2. In Ethos Suite, open the **Lua Library** tab.
 3. Choose **Install lua script** and select the ZIP file.
 4. Let Ethos Suite copy the script to the radio storage, then assign the
@@ -61,12 +61,16 @@ scripts/
 `launches.csv`, `events.csv`, `gliders.csv`, and `config.csv` there
 automatically as it runs.
 
-### Install manually on the SD card
+### Install manually via the SD card or internal storage
 
-1. Open the SD card used by the radio.
-2. Copy the `ThrowTrn` folder into the `scripts` folder on the card so the
-   final script path is `scripts/ThrowTrn/main.lua`.
-3. Safely eject the card and start the radio.
+Ethos radios can store scripts either on a removable SD card or in the
+transmitter's internal storage — use whichever your radio is set up with.
+
+1. Connect the radio to your computer and open its storage (SD card or
+   internal storage, depending on your setup) in your file manager.
+2. Copy the `ThrowTrn` folder into the `scripts` folder there so the final
+   script path is `scripts/ThrowTrn/main.lua`.
+3. Safely disconnect/eject and start (or reboot) the radio.
 4. Open the model where the widget will be used, go to screen
    configuration, choose a widget location, and select "Throw Trainer".
 5. Open the widget configuration page and set floor/ceiling height, the
