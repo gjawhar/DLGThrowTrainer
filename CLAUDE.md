@@ -21,7 +21,7 @@ Package layout Ethos expects, unzipped onto the transmitter's SD card:
 scripts/ThrowTrn/
 ├── main.lua      -- registers the widget, wires all modules together
 ├── core.lua      -- state, persistence, capture, grouping, statistics
-├── draw.lua      -- all rendering (shared by every screen size/tier)
+├── draw.lua      -- all rendering (shared by both the Full and Half sizes)
 ├── screen.lua    -- the interactive app surface (main page, log page, keys)
 ├── config.lua    -- the Settings form
 └── Files/        -- runtime data lives here (launches.csv, events.csv,
@@ -44,12 +44,17 @@ own "Throw Trainer settings" menu entry — both call the same code).
 - **`core.lua`** — the only place that touches files, computes statistics,
   or knows what a "group"/"set" is. Everything else asks core for numbers
   and draws them. `core.recordLaunch(height, unit, ts)` is the single
-  injection seam every capture path goes through.
-- **`draw.lua`** — all `lcd.*` drawing calls live here. Three widget
-  "tiers" (A/B/C) for different cell sizes, all sharing one bar-strip
-  renderer. Also owns the dark/light palette.
-- **`screen.lua`** — the interactive layer: soft-key row, focus/rotary
-  handling, the log page, dialogs. Shared between what used to be two
+  injection seam every capture path goes through. Also owns hardware
+  FS1-FS4 resolution/polling (`core.pollFS`) — see fact #10 below.
+- **`draw.lua`** — all `lcd.*` drawing calls live here. Two supported
+  sizes now (2026-09 rework, see `screen.lua`'s `layoutKind`) — "full" and
+  a wide "half" — sharing one bar-strip renderer; anything smaller gets
+  `draw.widget`'s plain "needs Full or Half width" message. The old
+  three-tier (A/B/C) compact-cell system was removed at the pilot's
+  request. Also owns the day/night palette (`draw.palette`, default day).
+- **`screen.lua`** — the interactive layer: the top key row (FS1-4-aligned,
+  MARK/UNDO/LOG/CFG), focus/rotary handling, touch hit-testing (see fact
+  #10 below), the log page, dialogs. Shared between what used to be two
   hosts (widget + tool); now just the widget, but the option-based
   `screen.new(opts)` API was kept since it doesn't cost anything and the
   separation is still useful.
@@ -86,17 +91,21 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
    limit. (Moot now since the System Tool was removed, but worth knowing if
    a second surface is ever added back.)
 
-4. **A widget on a model screen cannot reliably build its own form pages
-   from its own event handler.** It *can* build a form via the dedicated
-   `configure()` callback (that's what `widgetConfigure` in `main.lua`
-   does, and it works). But wiring a "CONFIG" soft-key into the widget's
-   own custom key-handling loop and calling `form.clear()`/`config.build()`
-   from there was tried once and it broke things badly: it crashed the
-   widget's `wakeup()`, which also happens to be what drives real capture,
-   so throws silently stopped being recorded — at the same time a
-   persistent, system-wide (visible on every screen) error triangle
-   appeared. **Do not re-add a CONFIG key to the widget's own soft-key row**
-   without a from-scratch hardware test of that specific path.
+4. **A widget on a model screen building its own form pages from its own
+   event handler is fragile — verify on real hardware before trusting it.**
+   It has always reliably worked via the dedicated `configure()` callback
+   (that's what `widgetConfigure` in `main.lua` does). Wiring a "CONFIG"
+   soft-key into the widget's own custom key-handling loop and calling
+   `form.clear()`/`config.build()` from there was tried once (pre-2026-09)
+   and crashed `wakeup()` — which also drives real capture, so throws
+   silently stopped being recorded, with a persistent system-wide error
+   triangle as the only visible symptom. It was re-added 2026-09 at the
+   pilot's request (see `main.lua`'s CONFIG comment) and has since tested
+   clean in the simulator on both X14 and X20RS, including repeated
+   touch-driven opens/closes — but **the specific failure mode was a
+   capture outage with no on-screen error**, so treat it as unverified
+   until it's been run on real hardware for a real flying session, not
+   just confirmed by "the UI looks right in the sim."
 
 5. **Logic switches read ±100, not 0/1.** A "false" switch reads `-100`,
    not `0`. Always test `> 0`, never truthiness.
@@ -132,6 +141,23 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
    bug above), but it's a real, separate, cheap-to-keep defense and was
    left in.
 
+10. **Function Switches (FS1-FS4) are not logic switches and have no
+    documented `CATEGORY_*` constant.** Confirmed via the sister DLGPoker
+    project's own hardware sweep: asking a manually-picked FS1 source what
+    it is returned raw category number `12`, member `0`, with FS2-FS4 as
+    members 1-3 of that same numeric category (`core.lua`'s
+    `FS_CATEGORY_NUMERIC`). This literal is inherently fragile — not from
+    any FrSky documentation, could differ on another Ethos build — but
+    it's the only approach confirmed to work. **A tap on a touch-capable
+    radio (confirmed on X20RS, 2026-09) fires the widget's `event()`
+    callback TWICE per tap** (once on press, once on release), and there is
+    no reliable `value`/`category` signal distinguishing the two — both
+    calls came back identical on category and near-identical on value (an
+    internal counter/timestamp, not a phase flag). `screen.lua`'s
+    `self.event` fixes this by pairing alternating touch calls and
+    swallowing every other one (`V.touchConsuming`), rather than trying to
+    identify which phase is which.
+
 ## Key design decisions worth preserving
 
 - **One injection seam.** `core.recordLaunch()` is the only way a throw
@@ -160,11 +186,12 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
   was a real bug: with no MARK pressed, 5 real throws in "Set 1" would
   display as "n=2" because the fallback comparison window only fit 2 per
   side. Do not re-merge these.
-- **Soft key identifiers vs. labels are separate.** The keys array is
-  still `{"CHANGE", "UNDO", "LOG"}` internally (matches `core.change()`
-  etc.), but displayed labels are remapped via `KEY_LABEL` in `screen.lua`
-  (CHANGE → "MARK", CONFIG → "CFG"). If you rename a key's *label* again,
-  do it in that map, not by renaming the identifier everywhere.
+- **Soft key identifiers vs. labels are separate.** The widget's keys
+  array is `{"CHANGE", "UNDO", "LOG", "CONFIG"}` internally (matches
+  `core.change()` etc., and 1:1 with FS1-FS4), but displayed labels are
+  remapped via `KEY_LABEL` in `screen.lua` (CHANGE → "MARK", CONFIG →
+  "CFG"). If you rename a key's *label* again, do it in that map, not by
+  renaming the identifier everywhere.
 - **CSV schema has a trailing `seed` column** on launch rows (`"1"` or
   `""`). Sample/demo data seeded via Config → Data → "Seed sample data" is
   flagged this way and auto-purges itself the moment a genuine throw comes
@@ -216,11 +243,27 @@ don't round-trip through config).
 **Verified on real hardware (X14, Ethos 26.1.1):** real capture via the
 DLG template's `ALT_CALL`/`MOM_LAUNCH` logic switches, persistence across
 multiple reboots, settings opening via both the long-press menu and native
-configure, light/dark theme switching, the bar strip with per-bar labels
+configure, day/night theme switching, the bar strip with per-bar labels
 and group-boundary markers, identity binding via `model.id()`+name in
 `gliders.csv`.
 
-**Not verified / best-effort only:**
+**Verified in the simulator only, NOT yet on real hardware (2026-09
+rework — the whole point of this batch was "next time you field-test,
+check these"):**
+- The Full/Half two-size layout system and the removal of the old
+  three-tier compact readout.
+- The CONFIG key re-added to the widget's own soft-key row — see fact #4,
+  this is the one with real crash history and needs a full flying session,
+  not just simulator confirmation.
+- Hardware FS1-FS4 driving MARK/UNDO/LOG/CFG, focus-gated so none of it
+  fires unless the widget is the visible, focused thing on screen.
+- Touch support on a touch-capable radio (tested on the X20RS simulator;
+  the double-fire-per-tap pairing fix in fact #10 has not been confirmed
+  on a physical touchscreen).
+- Auto-seeded demo data (with a marker) on a fresh install, and the
+  existing purge-on-real-throw behavior correctly clearing it.
+
+**Not verified / best-effort only (pre-existing, unrelated to the above):**
 - The switch-persistence bug above.
 - Whether widget background execution (`wakeup()` continuing on a
   different screen of the same model) holds on this specific Ethos

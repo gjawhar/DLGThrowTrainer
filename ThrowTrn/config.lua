@@ -44,9 +44,6 @@ function config.build(onErase, onDone)
   local line = panel:addLine("Minimum height")
   num(line, 0, maxH, "floor", u)
 
-  line = panel:addLine("Maximum height")
-  num(line, 1, maxH, "ceiling", u)
-
   line = panel:addLine("Comparison window")
   num(line, 3, 200, "window", "throws")
 
@@ -67,7 +64,7 @@ function config.build(onErase, onDone)
   num(line, 0, 12, "bars")
 
   line = panel:addLine("Theme")
-  form.addChoiceField(line, nil, { { "Dark", 1 }, { "Light", 2 } },
+  form.addChoiceField(line, nil, { { "Night", 1 }, { "Day", 2 } },
     function() return cfg().theme end,
     function(v)
       cfg().theme = v

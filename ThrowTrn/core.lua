@@ -4,7 +4,7 @@
 
 local core = {}
 
-core.VERSION = "1.1.1"
+core.VERSION = "1.4.0"
 
 -- ---------------------------------------------------------------- constants
 
@@ -34,9 +34,19 @@ local S = {
   altSrc     = nil,
   callSrc    = nil,
   launchSrc  = nil,
+  fs1        = nil,              -- hardware CHANGE
+  fs2        = nil,              -- hardware UNDO
+  fs3        = nil,              -- hardware LOG
+  fs4        = nil,              -- hardware CONFIG
+  -- All four only act once Throw Trainer's widget is the visible, focused
+  -- thing on screen -- see main.lua's widgetWakeup and core.pollFS below.
   prevCall   = -100,
   prevChange = -100,
   prevUndo   = -100,
+  prevFS1    = -100,
+  prevFS2    = -100,
+  prevFS3    = -100,
+  prevFS4    = -100,
   lastChangeAt = 0,
   undoArmed    = false,
   cfg        = {},
@@ -46,17 +56,17 @@ core.S = S
 
 -- ---------------------------------------------------------------- config
 
-local DEFAULTS_FT = { floor = 25,  ceiling = 180 }
-local DEFAULTS_M  = { floor = 8,   ceiling = 55  }
+local DEFAULTS_FT = { floor = 25 }
+local DEFAULTS_M  = { floor = 8  }
 
 local function defaults()
   local d = {
     floor        = DEFAULTS_FT.floor,
-    ceiling      = DEFAULTS_FT.ceiling,
     timeout      = 15,          -- capture window cap, seconds
     bars         = 0,           -- 0 = auto
     window       = 20,          -- rolling comparison window
-    theme        = 1,           -- 1 Dark, 2 Light
+    theme        = 2,           -- 1 Night, 2 Day -- day/outdoor use is the
+                                 -- common case, so that's the default now
     changeSwitch = nil,
     undoSwitch   = nil,
   }
@@ -65,12 +75,11 @@ end
 
 core.defaults = defaults
 
--- Swap the floor/ceiling defaults for metres rather than converting 25 ft
--- into an awkward 7.6 m. Only applied while the value is still the default.
+-- Swap the floor default for metres rather than converting 25 ft into an
+-- awkward 7.6 m. Only applied while the value is still the default.
 local function applyUnitDefaults()
   if S.unit ~= "m" then return end
   if S.cfg.floor == DEFAULTS_FT.floor then S.cfg.floor = DEFAULTS_M.floor end
-  if S.cfg.ceiling == DEFAULTS_FT.ceiling then S.cfg.ceiling = DEFAULTS_M.ceiling end
 end
 
 function core.activeGid()
@@ -236,6 +245,9 @@ end
 -- storage. Storage travels with a cloned model and so cannot distinguish a
 -- clone from its original; a clone receives a fresh receiver number, so it
 -- simply will not be found here and is minted a new id automatically.
+-- Returns true when this glider has never been seen before (a fresh mint,
+-- not a rename of an existing one) -- the caller uses that to decide
+-- whether to seed demo data, see loadIdentityData below.
 local function bindIdentity()
   S.modelId = modelIdString()
   S.name    = modelName()
@@ -252,6 +264,7 @@ local function bindIdentity()
   end
 
   local hit = byBoth or byId
+  local fresh = not hit
   if hit then
     S.gid = hit[1]
     if hit[3] ~= S.name then       -- renamed: refresh the readable name only
@@ -265,6 +278,7 @@ local function bindIdentity()
   end
 
   if changed then rewrite("gliders", rows) end
+  return fresh
 end
 
 -- ---------------------------------------------------------------- sources
@@ -283,10 +297,31 @@ local function getLogic(name)
   return nil
 end
 
+-- Function Switches (FS1-FS4) are not logic switches and have no
+-- documented CATEGORY_* constant -- confirmed via the DLGPoker project's
+-- own hardware sweep (its spec S11): asking a manually-picked FS1 source
+-- what it is returned raw category number 12, member 0, with FS2-FS4 as
+-- members 1-3 of that same numeric category. This literal is inherently
+-- fragile -- not from any FrSky documentation, and could differ on
+-- another Ethos build or radio family -- but it's the only approach
+-- confirmed to actually work.
+local FS_CATEGORY_NUMERIC = 12
+
+local function getFS(member)
+  local ok, src = pcall(system.getSource,
+    { category = FS_CATEGORY_NUMERIC, member = member })
+  if ok then return src end
+  return nil
+end
+
 local function resolveSources()
   S.altSrc    = getSensor("Altitude")
   S.callSrc   = getLogic("ALT_CALL")
   S.launchSrc = getLogic("MOM_LAUNCH")
+  S.fs1 = getFS(0)
+  S.fs2 = getFS(1)
+  S.fs3 = getFS(2)
+  S.fs4 = getFS(3)
   if S.altSrc then
     local ok, u = pcall(function() return S.altSrc:stringUnit() end)
     if ok and type(u) == "string" and u ~= "" then S.unit = u end
@@ -666,8 +701,12 @@ function core.recordLaunch(height, unit, ts)
     return "low"                    -- discarded silently, armed state intact
   end
 
+  -- No ceiling/ "high" flag on new throws any more -- removed at the pilot's
+  -- request (S.cfg.ceiling no longer exists). A "high" status can still show
+  -- up on log/strip rows written by an older version of the app before this
+  -- removal; draw.lua and screen.lua still render that legacy status
+  -- correctly rather than silently reinterpreting old data.
   local st = "ok"
-  if height > (S.cfg.ceiling or 180) then st = "high" end
 
   local grp = core.currentGroup()
   S.seq = S.seq + 1
@@ -682,11 +721,17 @@ function core.recordLaunch(height, unit, ts)
   return st
 end
 
--- Pre-loads a flat, unlabeled set of sample throws so the UI has something
--- to show before the first real flight. Not counted toward this session
--- (so UNDO can't pick a seed row apart one at a time -- Erase or a real
--- throw are the only ways out), and refuses to run over an existing real
--- log rather than silently discarding it.
+-- Pre-loads a set of sample throws so the UI has something to show before
+-- the first real flight -- split across two sets with a marker between
+-- them (2026-09, pilot's request), so the demo actually exercises the
+-- current/previous-set comparison and the strip captions, instead of one
+-- flat, uncomparable blob of bars. Not counted toward this session (so
+-- UNDO can't pick a seed row apart one at a time -- Erase or a real throw
+-- are the only ways out), and refuses to run over an existing real log
+-- rather than silently discarding it. The marker event needs no seed flag
+-- of its own -- purgeSeedIfPresent already wipes every event for this
+-- glider the moment any seeded launch is found, which is safe here since
+-- a fresh/all-seed log can't have a real event to lose yet.
 function core.seedDemo(n, minHeight, maxHeight)
   if #S.launches > 0 then
     core.setStatus("erase real data first")
@@ -697,17 +742,26 @@ function core.seedDemo(n, minHeight, maxHeight)
   maxHeight = maxHeight or 95
   local gid = S.gid
   local base = os.time()
+  local firstN = math.max(1, math.floor(n / 2))
 
   for i = 1, n do
+    if i == firstN + 1 then
+      S.seq = S.seq + 1
+      local markTs = base - (n - i)
+      S.events[#S.events + 1] = { ts = markTs, type = "change", grp = 2, seq = S.seq }
+      appendRow("events", { tostring(markTs), gid, "change", "2" })
+    end
+
+    local grp = (i <= firstN) and 1 or 2
     S.seq = S.seq + 1
     local ts = base - (n - i)
     local height = math.random(minHeight, maxHeight)
     S.launches[#S.launches + 1] = {
-      ts = ts, h = height, u = S.unit, grp = 1, st = "ok",
+      ts = ts, h = height, u = S.unit, grp = grp, st = "ok",
       seed = true, seq = S.seq,
     }
     appendRow("launches", { tostring(ts), gid, tostring(height), S.unit,
-                            "1", "ok", "1" })
+                            tostring(grp), "ok", "1" })
   end
   core.setStatus(string.format("seeded %d sample throws from %d-%d %s",
     n, minHeight, maxHeight, S.unit))
@@ -922,34 +976,59 @@ local function switchRose(src, prevKey)
   return prev <= 0 and v > 0
 end
 
+-- switchRose already requires a genuine low-to-high transition, so this only
+-- has to stop a contact bouncing within the same second.
+local function fireChange()
+  if os.time() ~= S.lastChangeAt then
+    S.lastChangeAt = os.time()
+    S.undoArmed = false
+    core.change()
+  end
+end
+
+-- Destructive with no screen on this path, so it needs two activations.
+-- Armed state rather than a stopwatch: os.clock measures CPU time, which
+-- starts near zero and advances far slower than real time, so a timed
+-- window would have treated the very first flick as a confirmation.
+local function fireUndoFlick()
+  if S.undoArmed then
+    S.undoArmed = false
+    if core.undoTarget() then core.undo() else core.setStatus("nothing to undo") end
+  elseif core.undoTarget() then
+    S.undoArmed = true
+    core.setStatus("flick UNDO again to remove")
+  else
+    core.setStatus("nothing to undo")
+  end
+end
+
+-- Pilot-assignable CHANGE/UNDO switches only -- these fire regardless of
+-- which widget/screen currently has focus, by design (a dedicated switch
+-- is a deliberate assignment, not a stray input). Hardware FS1-FS4 are
+-- handled separately by core.pollFS below: at the pilot's explicit request
+-- (2026-09) NONE of the four act until Throw Trainer's widget is actually
+-- the visible, focused thing on screen -- see main.lua's widgetWakeup for
+-- where that gate lives.
 local function pollSwitches()
   local cs = S.cfg.changeSwitch
-  if cs and switchRose(cs, "prevChange") then
-    -- switchRose already requires a genuine low-to-high transition, so this
-    -- only has to stop a contact bouncing within the same second.
-    if os.time() ~= S.lastChangeAt then
-      S.lastChangeAt = os.time()
-      S.undoArmed = false
-      core.change()
-    end
-  end
+  if cs and switchRose(cs, "prevChange") then fireChange() end
 
   local us = S.cfg.undoSwitch
-  if us and switchRose(us, "prevUndo") then
-    -- Destructive with no screen on this path, so it needs two activations.
-    -- Armed state rather than a stopwatch: os.clock measures CPU time, which
-    -- starts near zero and advances far slower than real time, so a timed
-    -- window would have treated the very first flick as a confirmation.
-    if S.undoArmed then
-      S.undoArmed = false
-      if core.undoTarget() then core.undo() else core.setStatus("nothing to undo") end
-    elseif core.undoTarget() then
-      S.undoArmed = true
-      core.setStatus("flick UNDO again to remove")
-    else
-      core.setStatus("nothing to undo")
-    end
-  end
+  if us and switchRose(us, "prevUndo") then fireUndoFlick() end
+end
+
+-- Hardware FS1-FS4, matching the on-screen CHANGE/UNDO/LOG/CONFIG key row
+-- 1:1. This only does the edge-detection and reports which one (if any)
+-- rose this tick -- the focus/visibility gate and the actual dispatch live
+-- in main.lua's widgetWakeup, which is the layer that actually knows about
+-- screen.lua and can check whether this widget instance is the one
+-- currently on screen.
+function core.pollFS()
+  if switchRose(S.fs1, "prevFS1") then return 1 end
+  if switchRose(S.fs2, "prevFS2") then return 2 end
+  if switchRose(S.fs3, "prevFS3") then return 3 end
+  if switchRose(S.fs4, "prevFS4") then return 4 end
+  return nil
 end
 
 -- ---------------------------------------------------------------- lifecycle
@@ -969,14 +1048,27 @@ local function identityStillCurrent()
   return modelIdString() == S.modelId
 end
 
+-- Shared by core.init and the mid-session re-bind in core.wakeup below --
+-- same load, same fresh-glider check either way. A never-before-seen
+-- glider gets seeded with demo data out of the box (2026-09, pilot's
+-- request) instead of starting on a blank "waiting for a throw" screen --
+-- the exact same core.seedDemo the Config -> Data "Seed sample data"
+-- button uses, marker included, purged automatically the moment a real
+-- throw comes in (core.recordLaunch's purgeSeedIfPresent), exactly like a
+-- manually-seeded set already is.
+local function loadIdentityData(fresh)
+  loadConfig()
+  loadLog()
+  if fresh then core.seedDemo() end
+end
+
 function core.init()
   if S.ready then return end
   S.dir = resolveDir()
   if not S.dir then S.ioError = "no writable Files/ folder" end
   resolveSources()
-  bindIdentity()
-  loadConfig()
-  loadLog()
+  local fresh = bindIdentity()
+  loadIdentityData(fresh)
   -- A power cycle closes the open group without arming CHANGE.
   if #S.launches > 0 and not core.isArmed() then
     addEvent("power")
@@ -995,9 +1087,8 @@ function core.wakeup()
     return
   end
   if not identityStillCurrent() then
-    bindIdentity()
-    loadConfig()
-    loadLog()
+    local fresh = bindIdentity()
+    loadIdentityData(fresh)
   end
   realCapture()
   pollSwitches()

@@ -1,4 +1,4 @@
--- ThrowTrainer 1.3.0 -- DLG throw height trainer for FrSky Ethos.
+-- ThrowTrainer 1.4.0 -- DLG throw height trainer for FrSky Ethos.
 --
 -- Widget-only. A full-screen System Tool used to be registered alongside the
 -- widget (see project history for why: FrSky's own lazy-loading example
@@ -24,17 +24,16 @@ local screen = assert(loadfile("screen.lua"))(core, draw, config)
 -- compact read-out, because soft keys and a log page cannot be made legible
 -- in a quarter cell.
 --
--- REVERTED: a CONFIG key was tried here briefly, wired to the same
--- form-building code Config uses via widgetConfigure below. This project's
--- own prior history had already flagged that a widget on a model screen may
--- not be able to build form pages, and testing confirmed it: the resulting
--- crash took the widget's wakeup down with it, which also happens to be
--- what drives real capture (core.wakeup), so throws silently stopped being
--- recorded at the same time a global script-error indicator appeared. Do
--- not re-add "CONFIG" here without a from-scratch verification that
--- form.clear() / config.build() actually work from a widget's own event
--- handler, not just from its dedicated configure() callback (which is what's
--- still used below, and is the only route confirmed safe).
+-- CONFIG key re-added 2026-09 at the pilot's request (reaching settings by
+-- backing out of the widget was too much friction). An earlier attempt at
+-- this same thing crashed on a widget-hosted model screen -- form-building
+-- from a widget's own event handler, not from its dedicated configure()
+-- callback, took wakeup() down with it, which silently stopped real
+-- capture too. This needs a from-scratch re-verification on real hardware
+-- (not just the simulator) before it ships: press CFG, confirm the form
+-- opens and closes cleanly, then confirm a throw still gets recorded
+-- afterward -- a capture outage here is invisible until someone notices
+-- their throws stopped counting.
 -- pcall-wrapped for the same reason wakeup/paint already are: if core.init()
 -- throws here, this whole function used to abort before ever reaching the
 -- `return`, which meant Ethos never got a proper widget instance back and
@@ -50,7 +49,7 @@ local function widgetCreate()
   if not ok then core.setStatus("init error: " .. tostring(err)) end
   return {
     app = screen.new({
-      keys       = { "CHANGE", "UNDO", "LOG" },
+      keys       = { "CHANGE", "UNDO", "LOG", "CONFIG" },
       dialogs    = false,   -- UNDO still double-presses rather than a dialog
       needsFocus = true,    -- keys are dimmed until the widget has focus
     }),
@@ -87,6 +86,21 @@ end
 local function widgetWakeup(widget)
   local ok, err = pcall(core.wakeup)
   if not ok then core.setStatus("wakeup error: " .. tostring(err)) end
+
+  -- Hardware FS1-FS4, mirroring CHANGE/UNDO/LOG/CONFIG 1:1. None of them
+  -- act until THIS widget instance is confirmed to be the visible, focused
+  -- one on screen (pilot's explicit request, 2026-09) -- otherwise bumping
+  -- any of FS1-4 anywhere else in the radio would quietly act on Throw
+  -- Trainer even when nobody's looking at it. Polled every wakeup
+  -- regardless (core.pollFS does its own edge-detection so state doesn't go
+  -- stale while unfocused), but only acted on here.
+  local ok2, fs = pcall(core.pollFS)
+  if ok2 and fs and widget and widget.app and lcd.hasFocus and lcd.hasFocus()
+     and widget.app.fits(lcd.getWindowSize()) then
+    local ok3, err3 = pcall(widget.app.pressKey, fs)
+    if not ok3 then core.setStatus("FS error: " .. tostring(err3)) end
+  end
+
   lcd.invalidate()
 end
 
@@ -104,7 +118,27 @@ local function widgetEvent(widget, category, value, x, y)
   if lcd.isSwiping and lcd.isSwiping() then return false end
   if lcd.hasFocus and not lcd.hasFocus() then return false end
 
-  local handled = widget.app.event(value, x)
+  -- pcall-wrapped: this is where the new, least-verified code lives (touch
+  -- hit-testing, and CONFIG's form-building -- see the crash history noted
+  -- above widgetCreate). An error here should not propagate and silently
+  -- take wakeup()/real capture down with it.
+  --
+  -- category is threaded through (previously dropped), though it turned
+  -- out not to be the fix: a tap was firing screen.lua's activate() twice
+  -- (confirmed on X20RS, 2026-09 -- MARK went armed then immediately
+  -- cancelled from one tap), and the theory was that category/value
+  -- distinguish press from release the way KEY_xxx_FIRST/KEY_xxx_BREAK do
+  -- for a physical key. A debug readout showed both calls came back with
+  -- the same category and near-identical, non-enum-looking values -- an
+  -- internal counter/timestamp, not a phase flag -- so screen.lua's fix
+  -- instead just pairs up alternating touch calls and swallows every
+  -- other one, regardless of value/category. category stays threaded
+  -- through since it's harmless and may still be useful later.
+  local ok, handled = pcall(widget.app.event, value, x, y, category)
+  if not ok then
+    core.setStatus("event error: " .. tostring(handled))
+    return true
+  end
   -- Any key we act on is also activity, so the focus timeout restarts and the
   -- widget does not drop focus mid-interaction.
   if handled and lcd.resetFocusTimeout then pcall(lcd.resetFocusTimeout) end
@@ -115,7 +149,8 @@ end
 -- editor whether or not any throws exist. screen.confirmErase is a module-
 -- level function (not tied to any particular screen.new() instance), so
 -- this shares exactly the same erase confirmation as the widget's own CFG
--- route would if it existed -- one implementation, not two that can drift.
+-- key (screen.lua's activate()) -- one implementation, not two that can
+-- drift.
 --
 -- pcall-wrapped: this was the one remaining place in the app calling
 -- something that can fail without any error protection. If config.build()

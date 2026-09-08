@@ -7,14 +7,29 @@
 --
 --   dialogs -- true if the host may build forms/open modal dialogs.
 --   keys    -- the soft-key row this host shows. The widget uses
---              CHANGE/UNDO/LOG; CONFIG is intentionally absent, since
---              settings are reached through the widget's own configure()
---              route (see main.lua), not through this key row.
+--              CHANGE/UNDO/LOG/CONFIG, one key per physical FS switch (see
+--              main.lua for the crash history behind re-adding CONFIG here
+--              and what still needs re-verifying on real hardware).
 
 local core, draw, config = ...
 local screen = {}
 
 local MAIN, LOG = 1, 4
+
+-- Touch support (X20RS and other touch-capable radios): tap a key directly
+-- instead of rotating focus onto it first. Same heuristic already confirmed
+-- working in the DLGPoker project -- system.getVersion().board, excluding
+-- "X14" specifically, since there is no confirmed "has touchscreen" field
+-- to check directly. Computed once, not every frame -- the board is not
+-- going to change mid-session.
+local touchCapable = nil
+local function isTouchCapable()
+  if touchCapable ~= nil then return touchCapable end
+  local ok, v = pcall(system.getVersion)
+  local board = (ok and v and v.board) or ""
+  touchCapable = not string.find(tostring(board), "X14")
+  return touchCapable
+end
 
 -- Safe button first, so the default action is never destructive. Doesn't
 -- depend on any per-instance state, so it's exposed at module level and
@@ -55,6 +70,13 @@ function screen.new(opts)
     seenN     = 0,
     keys    = opts.keys,
     dialogs = opts.dialogs,
+    -- Hit-test rectangles for the current key row, rebuilt every paint --
+    -- keyed by the SAME index activate() already uses for rotary+enter, so
+    -- a tap and a rotary-select land on exactly the same action.
+    keyRects = {},
+    -- True between a tap's press and its still-pending release call --
+    -- see self.event's touch-pairing comment.
+    touchConsuming = false,
   }
 
   local self = { V = V }
@@ -107,13 +129,36 @@ function screen.new(opts)
 
   -- ------------------------------------------------------------ main page
 
-  -- The full surface needs the header block, a usable strip and the soft-key
-  -- row. Below that it degrades to the compact read-out rather than drawing
-  -- off the bottom edge. A tool is always given a full screen, so this only
-  -- fires for unexpected geometry.
-  local function fits(w, h)
+  -- Throw Trainer is only offered at two sizes, both chosen at the pilot's
+  -- request (2026-09) so the numbers stay legible and the strip has room to
+  -- be read at a glance -- anything smaller falls back to draw.widget's
+  -- plain "needs Full or Half" message.
+  --   full -- the rich, interactive layout: key row, LAST LAUNCH + COMPARE
+  --           panels, then the strip.
+  --   half -- a wide-but-shorter slot (the "super wide" one full-width
+  --           half-height placements make). Deliberately passive-only, by
+  --           the pilot's explicit request: no keys, no settings, no
+  --           marking a change -- just the bar strip, each bar labeled
+  --           with its own value, filling essentially the whole slot.
+  -- Width, not the tier label alone, is what actually distinguishes "half"
+  -- from a narrow-but-tallish cell that happens to clear the same height --
+  -- a half-width column is not what this shape means.
+  local function layoutKind(w, h)
     local m = draw.metrics(w, h)
-    return m.tier == "A" and h >= 12 * m.th
+    if m.tier == "A" and h >= 12 * m.th then return "full" end
+    -- The real bottom-half X14 slot measured out to ~6.5x th -- 7x
+    -- rejected it outright (confirmed on-device, 2026-09).
+    if w >= 20 * m.th and h >= 6 * m.th then return "half" end
+    return nil
+  end
+
+  -- Whether this instance currently accepts input at all. Half is passive
+  -- history only (see layoutKind above) -- no keys, nothing to focus -- so
+  -- only Full reports true here. main.lua's widgetEvent/widgetWakeup use
+  -- this to decide whether rotary, tap, or hardware FS should reach this
+  -- instance at all.
+  local function fits(w, h)
+    return layoutKind(w, h) == "full"
   end
 
   self.fits = fits
@@ -124,8 +169,26 @@ function screen.new(opts)
   -- else.
   local KEY_LABEL = { CHANGE = "MARK", UNDO = "UNDO", LOG = "LOG", CONFIG = "CFG" }
 
+  -- Shared by both layouts -- whatever's worth saying (an error, a stale-
+  -- telemetry warning) matters the same regardless of which one is showing.
+  local function drawStatus(pad, sy, w, p)
+    local status = core.status()
+    lcd.font(FONT_S)
+    if status then
+      lcd.color(p.armed)
+      draw.textAt(pad, sy, status, w - pad * 2)
+    elseif core.S.ioError then
+      lcd.color(p.bad)
+      draw.textAt(pad, sy, "storage: " .. core.S.ioError, w - pad * 2)
+    elseif not core.telemetryLive() then
+      lcd.color(p.bad)
+      draw.textAt(pad, sy, "no telemetry", w - pad * 2)
+    end
+  end
+
   local function paintMain(w, h)
-    if not fits(w, h) then
+    local kind = layoutKind(w, h)
+    if not kind then
       draw.widget(w, h)
       return
     end
@@ -139,11 +202,79 @@ function screen.new(opts)
     draw.clear(w, h, p)
     lcd.font(FONT_S)
 
-    -- Title bar: which glider, which set, and the unit everything below is
-    -- in -- read once here rather than repeated on every figure.
-    local y = pad
+    if kind == "half" then
+      -- Pure passive history, filling the entire slot: no key row, no
+      -- title bar, no hero number, no delta, and (2026-09) no "current
+      -- set"/"previous set" captions either -- this size is read-only by
+      -- design, so labelling which bars belong to which set implies a
+      -- kind of analysis this view isn't meant to offer. Marking a change
+      -- happens on the Full layout; this is just the bars, each one
+      -- labeled with its own value.
+      local stripH = h - pad * 2
+      if stripH < m.th * 2 then stripH = m.th * 2 end
+      draw.strip(pad, pad, w - pad * 2, stripH, core.strip(m.bars), m, p)
+      return
+    end
+
+    -- Key row first, pinned to the very top of the canvas. Physical
+    -- FS1-FS4 sit ABOVE the screen on the X14 (same layout the DLGPoker
+    -- project uses), so the on-screen labels sit as close to those buttons
+    -- as the canvas allows -- directly under them -- rather than at the
+    -- bottom, which used to force a top-to-bottom mental jump on every
+    -- press. Four keys (CHANGE, UNDO, LOG, CONFIG) line up 1:1 with
+    -- FS1-FS4, so there's no leftover key needing a special-cased spot.
+    --
+    -- On a widget these are only live once it has focus, so they're dimmed
+    -- until then to show that plainly. The focused key gets a solid fill
+    -- rather than a thin border -- a thin-vs-thick distinction was too
+    -- subtle to track while turning the wheel.
+    local live = (not opts.needsFocus) or (lcd.hasFocus and lcd.hasFocus())
+    local keyRowH = line + m.pad * 2
+    local kw = math.floor(w / #V.keys)
+    V.keyRects = {}
+    for i = 1, #V.keys do
+      local kx = (i - 1) * kw
+      local id = V.keys[i]
+      local label = KEY_LABEL[id] or id
+      local armedKey = (id == "CHANGE" and st.armed)
+      if armedKey then label = "CANCEL" end
+
+      local bx, by, bw2, bh2 = kx + 2, 0, kw - 4, keyRowH - m.pad
+      local focused = live and V.focus == i
+
+      if not live then
+        lcd.color(p.line)
+        lcd.drawRectangle(bx, by, bw2, bh2, 1)
+        lcd.color(p.line)
+      elseif focused then
+        lcd.color(armedKey and p.armed or p.text)
+        lcd.drawFilledRectangle(bx, by, bw2, bh2)
+        lcd.color(p.bg)
+      else
+        lcd.color(armedKey and p.armed or p.line)
+        lcd.drawRectangle(bx, by, bw2, bh2, 1)
+        lcd.color(armedKey and p.armed or p.dim)
+      end
+
+      local tw = lcd.getTextSize(label)
+      draw.textAt(kx + math.floor((kw - tw) / 2), m.pad, label, kw - 6)
+
+      -- Tap targets only exist once the row is actually live, matching the
+      -- visual affordance -- a dimmed, unfocused key can't be woken up by a
+      -- stray tap any more than it could by a stray rotary press.
+      if live and isTouchCapable() then
+        V.keyRects[i] = { x = kx, y = 0, w = kw, h = keyRowH }
+      end
+    end
+
+    -- Title bar: which glider, and the unit everything below is in -- read
+    -- once here rather than repeated on every figure. Sets are no longer
+    -- numbered (there's only ever "current" and "previous" -- see the strip
+    -- captions below), so there's nothing else to show here. Full only --
+    -- Half skips this entirely, see above.
+    local y = keyRowH + pad
     lcd.color(p.text)
-    draw.textAt(pad, y, string.format("%s . Set %d", core.S.name, st.group), w * 0.75)
+    draw.textAt(pad, y, core.S.name, w * 0.75)
     lcd.color(p.dim)
     local uw = lcd.getTextSize(st.unit)
     draw.textAt(w - pad - uw, y, st.unit)
@@ -168,20 +299,22 @@ function screen.new(opts)
 
     local suffix
     if st.armed then suffix = nil
-    elseif st.fallback then suffix = "vs previous"
-    else suffix = "vs prev set" end
+    else suffix = "vs previous set" end
     local _, bh = draw.deltaBadge(pad, y, st, suffix, colW, p)
     y = y + bh + m.pad
 
     lcd.font(FONT_S)
     lcd.color(p.dim)
+    -- No set number and no throw count here -- the strip right below shows
+    -- exactly these throws as bars, so a count would just repeat what's
+    -- already countable on screen.
     if st.afterN > 0 then
-      draw.textAt(pad, y, string.format("SET %d . n=%d", st.group, st.afterN), colW)
+      draw.textAt(pad, y, "CURRENT SET", colW)
       y = y + line
       draw.textAt(pad, y, string.format("avg %s  best %s",
         draw.fmt1(st.afterAvg), draw.fmt(st.afterBest)), colW)
     else
-      draw.textAt(pad, y, string.format("SET %d . no throws yet", st.group), colW)
+      draw.textAt(pad, y, "CURRENT SET . no throws yet", colW)
     end
 
     -- Right column: how this set stacks up against everything else on
@@ -191,12 +324,24 @@ function screen.new(opts)
     draw.textAt(rightX, ry, "COMPARE", w - rightX - pad)
     ry = ry + line + 2
 
+    -- "Last N" keeps its number -- that's a configured window size, not a
+    -- throw count, and it's not visible anywhere else on screen. Lifetime
+    -- and Previous set drop theirs: Previous set's throws are exactly the
+    -- "previous set" bars in the strip below (countable there), and
+    -- Lifetime's count is churn that doesn't change what to do next.
+    --
+    -- Always "Previous set", even in the st.fallback case (no CHANGE marked
+    -- yet, so this row is really a recent-vs-earlier split of one ongoing
+    -- set rather than two real sets) -- matching the wording used
+    -- everywhere else (the title bar, the strip captions) beat being
+    -- technically precise about a distinction the pilot has no way to see
+    -- on screen anyway.
     local rows = {
-      { label = st.fallback and "Previous" or string.format("Prev set . n=%d", st.cmpBeforeN),
+      { label = "Previous set",
         value = draw.fmt1(st.cmpBeforeAvg), color = p.text },
       { label = string.format("Last %d", st.windowTarget or 20),
         value = draw.fmt1(st.windowAvg), color = p.text },
-      { label = string.format("Lifetime . n=%d", st.allN),
+      { label = "Lifetime",
         value = draw.fmt1(st.allAvg), color = p.text },
       { label = "Best ever",
         value = draw.fmt(st.best), color = p.accent },
@@ -213,17 +358,21 @@ function screen.new(opts)
       ry = ry + line
     end
 
-    -- The strip. Capped well below "fill whatever's left", so it doesn't
-    -- crowd out the numbers above it or the two panels above that -- room
-    -- for a "marker" caption under a change boundary only when there's
-    -- genuinely space for a third text line below it.
-    local softH = line + m.pad * 2
+    -- The strip fills whatever's left below the two panels, minus one
+    -- reserved line for the status row underneath. A fixed 30%-of-h cap
+    -- used to sit here instead of an actual reservation; on the X14 it was
+    -- close enough to invisible, but on a bigger screen like the X20RS it
+    -- left a large dead patch of background between the strip and the
+    -- status line (confirmed on-device, 2026-09). statusH is reserved
+    -- unconditionally (whether or not there's a message to show right
+    -- now), so the bars don't visibly resize every time a status message
+    -- comes and goes.
+    local statusH = line
     local top = math.max(y, ry) + m.pad * 2
-    local avail = h - top - softH - pad
+    local avail = h - top - pad - statusH
     local wantCaption = avail > (m.th * 3)
     local capH = wantCaption and (m.th + 2) or 0
-    local maxStrip = math.floor(h * 0.30)
-    local stripH = math.min(avail - capH, maxStrip)
+    local stripH = avail - capH
     if stripH < m.th * 2 then stripH = m.th * 2 end
 
     draw.strip(pad, top, w - pad * 2, stripH, core.strip(m.bars), m, p)
@@ -231,59 +380,7 @@ function screen.new(opts)
       draw.stripCaptions(pad, top + stripH + 2, w - pad * 2, core.strip(m.bars), p)
     end
 
-    -- Status line, when there's something worth saying and room to say it.
-    local sy = top + stripH + capH + 2
-    local status = core.status()
-    lcd.font(FONT_S)
-    if status then
-      lcd.color(p.armed)
-      draw.textAt(pad, sy, status, w - pad * 2)
-    elseif core.S.ioError then
-      lcd.color(p.bad)
-      draw.textAt(pad, sy, "storage: " .. core.S.ioError, w - pad * 2)
-    elseif not core.telemetryLive() then
-      lcd.color(p.bad)
-      draw.textAt(pad, sy, "no telemetry", w - pad * 2)
-    end
-
-    -- Soft keys. On a widget these are only live once the widget has focus,
-    -- so they are dimmed until then to show that plainly. The focused key
-    -- gets a solid fill rather than a thin border -- the previous
-    -- thin-border-vs-thick-border distinction was too subtle to track while
-    -- turning the wheel, and MARK's accent border was drawn unconditionally
-    -- regardless of focus, which made it look permanently "selected" and
-    -- masked whichever key actually had focus.
-    local live = (not opts.needsFocus) or (lcd.hasFocus and lcd.hasFocus())
-    local kw = math.floor((w - pad * 2) / #V.keys)
-    local ky = h - softH
-    lcd.font(FONT_S)
-    for i = 1, #V.keys do
-      local kx = pad + (i - 1) * kw
-      local id = V.keys[i]
-      local label = KEY_LABEL[id] or id
-      local armedKey = (id == "CHANGE" and st.armed)
-      if armedKey then label = "CANCEL" end
-
-      local bx, by, bw2, bh2 = kx + 2, ky, kw - 4, softH - m.pad
-      local focused = live and V.focus == i
-
-      if not live then
-        lcd.color(p.line)
-        lcd.drawRectangle(bx, by, bw2, bh2, 1)
-        lcd.color(p.line)
-      elseif focused then
-        lcd.color(armedKey and p.armed or p.text)
-        lcd.drawFilledRectangle(bx, by, bw2, bh2)
-        lcd.color(p.bg)
-      else
-        lcd.color(armedKey and p.armed or p.line)
-        lcd.drawRectangle(bx, by, bw2, bh2, 1)
-        lcd.color(armedKey and p.armed or p.dim)
-      end
-
-      local tw = lcd.getTextSize(label)
-      draw.textAt(kx + math.floor((kw - tw) / 2), ky + m.pad, label, kw - 6)
-    end
+    drawStatus(pad, top + stripH + capH + 2, w, p)
   end
 
   -- ------------------------------------------------------------ log page
@@ -364,6 +461,16 @@ function screen.new(opts)
     lcd.invalidate()
   end
 
+  -- Public entry point for hardware FS1-FS4 -- see main.lua's widgetWakeup,
+  -- which only calls this once it's already confirmed this instance is the
+  -- visible, focused one. Mirrors what a tap or a rotary+ENTER on the same
+  -- key index would do.
+  function self.pressKey(i)
+    if V.inForm or V.screen ~= MAIN or not V.keys[i] then return end
+    V.focus = i
+    activate(i)
+  end
+
   -- Direction is in the key constant; x is a detent magnitude, so using it
   -- lets a fast spin move more than one step.
   local function step(value, x)
@@ -376,7 +483,26 @@ function screen.new(opts)
 
   -- ------------------------------------------------------------ events
 
-  function self.event(value, x)
+  function self.event(value, x, y, category)
+    -- Touch phase pairing. Confirmed on X20RS (2026-09): Ethos calls this
+    -- TWICE per tap -- once on press, once on release -- and there's no
+    -- reliable value/category signal to tell them apart (both calls came
+    -- back with the same category and near-identical, non-enum-looking
+    -- values -- an internal counter/timestamp, not a phase flag). Rather
+    -- than guess at an undocumented meaning, treat every OTHER touch call
+    -- as the closing half of the same gesture and swallow it outright.
+    --
+    -- This has to run before the V.inForm/V.screen gates below, not inside
+    -- them -- a key like LOG or CONFIG changes V.screen/V.inForm as its
+    -- own action, so the release half of THAT tap would arrive with
+    -- different gate state than the press half and could otherwise slip
+    -- past unswallowed (or, worse, get treated as a fresh press on
+    -- whatever's now underneath it).
+    if V.touchConsuming and isTouchCapable() and x and y and x > 0 and y > 0 then
+      V.touchConsuming = false
+      return true
+    end
+
     -- A form owns its own keys; only RTN needs intercepting to get back.
     if V.inForm then
       if value == KEY_RTN_FIRST or value == 99 then
@@ -392,6 +518,19 @@ function screen.new(opts)
         return true
       end
       return false
+    end
+
+    -- Touch: hit-test against the rectangles paintMain recorded this same
+    -- frame.
+    if V.screen == MAIN and isTouchCapable() and x and y and x > 0 and y > 0 then
+      for i, r in pairs(V.keyRects) do
+        if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
+          V.focus = i
+          activate(i)
+          V.touchConsuming = true
+          return true
+        end
+      end
     end
 
     if value == KEY_ROTARY_RIGHT or value == KEY_ROTARY_LEFT then

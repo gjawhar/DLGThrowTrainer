@@ -77,12 +77,13 @@ local function lightPalette()
   }
 end
 
--- Defaults to Dark (matches every screenshot in this project so far) until
--- the person picks Light in Config -> Display.
+-- Defaults to Day (theme 2 / lightPalette) -- most launches happen outdoors
+-- in daylight, where a dark canvas is hard to read. Night (theme 1) is a
+-- deliberate opt-in from Config -> Display.
 local function palette()
-  local theme = (core.S.cfg and core.S.cfg.theme) or 1
-  if theme == 2 then return lightPalette() end
-  return darkPalette()
+  local theme = (core.S.cfg and core.S.cfg.theme) or 2
+  if theme == 1 then return darkPalette() end
+  return lightPalette()
 end
 
 draw.palette = palette
@@ -325,129 +326,72 @@ function draw.strip(x, y, w, h, bars, m, p)
   end
 end
 
--- "marker" caption under a change boundary, for views with room to spare.
--- Power-on boundaries stay uncaptioned -- they're routine, not something the
--- pilot marked deliberately.
+-- "current set" / "previous set" under the bars that belong to each, for
+-- views with room to spare. Only sets are numbered internally (bars[].band
+-- is exactly the "after"/"before"/"old" tag core.strip() already computes),
+-- so there's nothing to count here -- just find each band's contiguous
+-- pixel span and centre its label in it.
+--
+-- A label only appears when it actually fits under its own span; a single
+-- narrow bar isn't captioned rather than truncated or overflowing into its
+-- neighbour's space. "old" bars (neither the current nor previous set) are
+-- never labelled.
 function draw.stripCaptions(x, y, w, bars, p)
-  local marks = draw.stripMarks(x, w, bars)
-  for i = 1, #marks do
-    if marks[i].kind ~= "power" then
-      lcd.color(p.marker)
-      local tw = lcd.getTextSize("marker")
-      draw.textAt(marks[i].x - math.floor(tw / 2), y, "marker")
-    end
-  end
-end
+  if #bars == 0 then return end
+  local slot = w / #bars
 
--- ---------------------------------------------------------------- widget cell
-
--- Three tiers because a quarter-screen cell physically cannot hold what a
--- full page can. Each tier is a complete answer at its size, not a truncation:
--- the last height and its direction are always visible, and room beyond that
--- is spent on "set" context, "prev set" context, then the strip, in that order.
-function draw.widget(w, h)
-  local m = draw.metrics(w, h)
-  local p = palette()
-  local st = core.stats(m.bars)
-  local pad = m.pad
-
-  lcd.font(FONT_S)
-
-  -- Empty state, any tier big enough for two lines. "AVG 0" over an empty
-  -- strip reads as a fault rather than as a new install, so say what this is
-  -- and where the controls are instead.
-  if st.allN == 0 and not st.armed then
-    local line = m.th + 2
-    lcd.color(p.text)
-    lcd.font(m.tier == "C" and FONT_S or FONT_M)
-    draw.textAt(pad, pad, "Throw Trainer", w - pad * 2)
-    if m.tier ~= "C" then
-      lcd.font(FONT_S)
-      lcd.color(p.dim)
-      local hint = "ready - waiting for a throw"
-      if lcd.getTextSize(hint) > w - pad * 2 then hint = "ready" end
-      draw.textAt(pad, pad + line + 2, hint, w - pad * 2)
-      -- This is exactly the screen a failed/not-yet-run core.init() lands
-      -- on (an uninitialized core reads as zero throws), so a pending error
-      -- status has to be visible here too, not just on the fully-loaded
-      -- layout -- otherwise a boot-time crash looks identical to a normal
-      -- fresh install with no way to tell them apart from the screen alone.
-      local status = core.status()
-      if status then
-        lcd.color(p.bad)
-        draw.textAt(pad, pad + line * 2 + 4, status, w - pad * 2)
+  local function spanOf(band)
+    local first, last
+    for i = 1, #bars do
+      if bars[i].band == band then
+        first = first or i
+        last = i
       end
     end
-    return
+    if not first then return nil end
+    return x + (first - 1) * slot, last - first + 1
   end
 
-  -- Tier C: the last height, and only a bare direction arrow -- no room for
-  -- a number-and-a-half of context, so don't try.
-  if m.tier == "C" then
-    local hy = math.floor((h - m.th * 1.6) / 2)
-    local hx = pad
-    local numColor = p.text
-    local bw = draw.hero(hx, hy, st.last and st.last.h, st.unit, numColor, FONT_L, FONT_S)
-    if not st.armed and st.delta then
-      local up = st.delta >= 0
-      lcd.font(FONT_M)
-      lcd.color(st.confident and (up and p.good or p.bad) or p.dim)
-      draw.textAt(hx + bw + 8, hy, up and "\226\150\178" or "\226\150\188")
-    elseif st.armed then
-      lcd.font(FONT_S)
-      lcd.color(p.armed)
-      draw.textAt(hx + bw + 8, hy + 4, "ARMED", w - hx - bw - 8)
-    end
-    return
+  local function caption(band, text, color)
+    local spanX, count = spanOf(band)
+    if not spanX then return end
+    local spanW = count * slot
+    local tw = lcd.getTextSize(text)
+    if tw > spanW - 4 then return end   -- wouldn't fit -- omit, don't cram
+    lcd.color(color)
+    draw.textAt(spanX + math.floor((spanW - tw) / 2), y, text)
   end
 
-  local line = m.th + 3
+  caption("after", "current set", p.after)
+  caption("before", "previous set", p.before)
+end
 
-  -- Tier B: the height, a compact delta pill top-right, and the current
-  -- set's average underneath it -- no header, no strip, there isn't room.
-  if m.tier == "B" then
-    draw.hero(pad, pad, st.last and st.last.h, st.unit, p.text, FONT_XL, FONT_M)
+-- ---------------------------------------------------------------- unsupported size
 
-    lcd.font(FONT_S)
-    local bw, bh = draw.deltaBadgeSize(st, nil, p)
-    local bx = w - pad - bw
-    draw.deltaBadge(bx, pad, st, nil, w * 0.42, p)
+-- Throw Trainer is only offered at two sizes -- Full and the wide Half slot
+-- (see screen.lua's layoutKind) -- both deliberately chosen so the numbers
+-- stay legible and the bar strip has room to be read at a glance. A smaller
+-- placement (a quarter cell, a narrow column) used to get a shrunk-down
+-- three-tier readout instead of this message, but that was always a
+-- compromise nobody could quite trust in the field, and the pilot decided
+-- it's not worth keeping now that Half covers the "still fairly compact"
+-- case properly. This has no keys and isn't interactive -- there's nowhere
+-- to put a key row this small anyway.
+function draw.widget(w, h)
+  local p = palette()
+  lcd.color(p.bg)
+  lcd.drawFilledRectangle(0, 0, w, h)
 
-    lcd.color(p.dim)
-    local sub = st.afterN > 0 and ("set " .. fmt1(st.afterAvg)) or "set --"
-    local sw = lcd.getTextSize(sub)
-    draw.textAt(w - pad - sw, pad + bh + 4, sub, w * 0.42)
-    return
-  end
-
-  -- Tier A: the full read-out short of the compare table -- hero number and
-  -- delta pill on the left, set/prev context top-right, strip along the
-  -- bottom so the shape of recent throws is visible without opening the tool.
   lcd.font(FONT_S)
-  lcd.color(p.dim)
-  draw.textAt(pad, pad, "LAST LAUNCH", w * 0.5)
+  local _, th = lcd.getTextSize("8")
+  if not th or th < 8 then th = 18 end
+  local pad = math.floor(th * 0.3)
 
   lcd.color(p.dim)
-  local setLine  = "set "  .. (st.afterN  > 0 and fmt1(st.afterAvg)  or "--")
-  local prevLine = "prev " .. (st.cmpBeforeN > 0 and fmt1(st.cmpBeforeAvg) or "--")
-  local sw = lcd.getTextSize(setLine)
-  draw.textAt(w - pad - sw, pad, setLine, w * 0.42)
-  sw = lcd.getTextSize(prevLine)
-  draw.textAt(w - pad - sw, pad + line - 2, prevLine, w * 0.42)
-
-  local hy = pad + line
-  local _, heroH = draw.hero(pad, hy, st.last and st.last.h, st.unit, p.text, FONT_XL, FONT_M)
-
-  local by = hy + heroH + 8
-  local bw, bh = draw.deltaBadge(pad, by, st,
-    (not st.armed and st.hasChange and not st.fallback) and "vs prev set" or nil,
-    w - pad * 2, p)
-
-  local top = by + bh + m.pad
-  local stripH = h - top - pad
-  if stripH < m.th then stripH = m.th end
-
-  draw.strip(pad, top, w - pad * 2, stripH, core.strip(m.bars), m, p)
+  draw.textAt(pad, pad, "Throw Trainer", w - pad * 2)
+  if h >= th * 2 then
+    draw.textAt(pad, pad + th + 2, "needs Full or Half width", w - pad * 2)
+  end
 end
 
 return draw
