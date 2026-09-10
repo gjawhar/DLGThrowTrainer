@@ -9,10 +9,21 @@ core.VERSION = "1.4.0"
 -- ---------------------------------------------------------------- constants
 
 local LOG_CAP       = 5000           -- rolling record cap
-local STALE_MS      = 2000           -- telemetry freshness gate
 local STATUS_SEC    = 3              -- status line dwell, wall-clock seconds
+-- The telemetry freshness gate is S.cfg.stale (seconds, 0 = off), see
+-- defaults() -- no longer a constant here.
 
 core.STATUS_SEC = STATUS_SEC
+
+-- DLG template flight-mode numbering (CATEGORY_FLIGHT member 0's value),
+-- confirmed in reference_category_flight.md. Setup marks are only watched
+-- for and only confirmed while in one of these two.
+local FM_LAUNCH = 2
+local FM_ZOOM   = 3
+-- Exposed so screen.lua can name a flight mode without hardcoding the DLG
+-- template's numbering a second time.
+core.FM_LAUNCH = FM_LAUNCH
+core.FM_ZOOM   = FM_ZOOM
 
 -- ---------------------------------------------------------------- state
 
@@ -34,10 +45,14 @@ local S = {
   altSrc     = nil,
   callSrc    = nil,
   launchSrc  = nil,
-  fs1        = nil,              -- hardware CHANGE
-  fs2        = nil,              -- hardware UNDO
-  fs3        = nil,              -- hardware LOG
-  fs4        = nil,              -- hardware CONFIG
+  -- Raw FS1-FS4 sources. What each ACTUALLY does is whatever screen.lua's
+  -- V.keys currently holds at that index (all 4 slots filled as of 2.0 --
+  -- CHANGE/LOG/CONFIG/SETUP) -- core.pollFS below only does edge-detection
+  -- and returns an index, it doesn't hardcode an action per FS.
+  fs1        = nil,
+  fs2        = nil,
+  fs3        = nil,
+  fs4        = nil,
   -- All four only act once Throw Trainer's widget is the visible, focused
   -- thing on screen -- see main.lua's widgetWakeup and core.pollFS below.
   prevCall   = -100,
@@ -50,12 +65,69 @@ local S = {
   lastChangeAt = 0,
   undoArmed    = false,
   cfg        = {},
+
+  -- ---- 2.0: auto-detected setup marks (camber/reflex, elevator, rudder
+  -- offset) -- see project memory project_throwtrainer_2.0_marks.md for
+  -- the full spec and the probe results these read mechanisms rest on.
+  camberSrc  = nil,   -- CATEGORY_TRIM member 2 ("Trim Throttle")
+  elevSrc    = nil,   -- CATEGORY_TRIM member 1 ("Trim Elevator")
+  rudSrc     = nil,   -- VAR "V_RudOffset", no category
+  fmSrc      = nil,   -- CATEGORY_FLIGHT member 0 ("Current F.M.")
+  -- Camber/elev baselines are PER FLIGHT MODE (keyed by FM_LAUNCH/FM_ZOOM)
+  -- -- confirmed via TrimProbe that a trim's value() only ever reflects
+  -- whichever mode is CURRENTLY active, so there is no way to read
+  -- Launch's camber while sitting in Zoom. Each mode's baseline is
+  -- captured lazily, the first time that mode is actually visited after a
+  -- reset -- see core.pollSetupChange. rud has no such split: V_RudOffset
+  -- is a Variable, not a trim, readable at any time regardless of flight
+  -- mode (only its EFFECT on the rudder channel is Launch-only).
+  baseCamberByFM = {},
+  baseElevByFM   = {},
+  baseRud    = nil,
+  rudBaselineAt = 0,  -- os.time() after which baseRud may be read, see
+                      -- RUD_SETTLE_SEC / core.captureSetupBaseline
+  -- Marks with grp > this count toward "since baseline", and the set just
+  -- before the first of them is what COMPARE's top row averages (see
+  -- core.baselineGroup). Never persisted directly -- derived from the log
+  -- on every load as the group of the most recent "revert" or "accept"
+  -- event (see deriveBaselineGrp), which is what makes it survive a power
+  -- cycle at all (an earlier version only ever set it in memory, so a
+  -- completed revert's baseline silently evaporated on reboot).
+  baselineGrp = 0,
+  -- pendingByFM[FM_LAUNCH] / pendingByFM[FM_ZOOM] = {camber=, elev=}
+  -- deltas, independently -- both can be live at once (the pilot adjusted
+  -- something in each mode before ever throwing), matching the approved
+  -- Setup Change Detected mockup showing both cards simultaneously.
+  pendingByFM = {},
+  pendingRud  = nil,  -- rud delta, watched only while fm == FM_LAUNCH
+  -- Edge-triggered, not level: true for exactly one paint after
+  -- hasPendingSetup() flips false->true, then consumed (see
+  -- core.consumeSetupJustDetected). screen.lua uses this to auto-switch to
+  -- the Setup Change Detected screen ONCE per newly-detected change, not on
+  -- every paint while a change sits pending -- otherwise a pilot who
+  -- deliberately backs out to LOG or CFG while a change is still
+  -- unconfirmed would get yanked back to it on the very next frame.
+  setupJustDetected = false,
+  -- Edge, same pattern: true for one paint after core.recordLaunch logs a
+  -- throw, consumed by screen.lua to drop back to Main from wherever it
+  -- was (see core.consumeLaunchRecorded).
+  launchJustRecorded = false,
+  -- Set only while the Reverting-to-Mark screen is live: { grp, ts, axes =
+  -- { {fm, axis, label, current, target}, ... }, rud = {label,current,target}
+  -- or nil }. Targets are snapshotted ONCE by core.beginRevert and never
+  -- recomputed from a moving "current" afterward -- see its own comment.
+  -- nil the rest of the time.
+  revertTarget = nil,
 }
 
 core.S = S
 
 -- ---------------------------------------------------------------- config
 
+-- Shipping defaults. (Dropped to 0/0 during 2026-09-09/10 simulator
+-- testing so telemetry-less sim throws still registered; restored for
+-- the field test. For sim work, lower "Minimum height" in CFG instead --
+-- it's a per-glider setting -- rather than editing this again.)
 local DEFAULTS_FT = { floor = 25 }
 local DEFAULTS_M  = { floor = 8  }
 
@@ -63,6 +135,12 @@ local function defaults()
   local d = {
     floor        = DEFAULTS_FT.floor,
     timeout      = 15,          -- capture window cap, seconds
+    stale        = 2,           -- telemetry freshness gate, seconds; 0 = off
+                                 -- (2026-09-10: a CFG setting rather than a
+                                 -- code constant so simulator testing, where
+                                 -- injected frames don't keep the sensor's
+                                 -- age fresh reliably, can switch it off
+                                 -- without a must-revert-before-shipping edit)
     bars         = 0,           -- 0 = auto
     window       = 20,          -- rolling comparison window
     theme        = 2,           -- 1 Night, 2 Day -- day/outdoor use is the
@@ -297,6 +375,18 @@ local function getLogic(name)
   return nil
 end
 
+-- Direct flight-mode read, confirmed working -- see project memory
+-- reference_category_flight.md. system.getFlightMode() does not exist on
+-- this firmware; CATEGORY_FLIGHT member 0 ("Current F.M.") is the real
+-- source, its :value() a live numeric index matching the DLG template's
+-- own numbering: 0=Cruise, 1=CAL, 2=Launch, 3=Zoom, 4=Landing, 5=Speed,
+-- 6=Therm2, 7=Therm1.
+local function getFlightModeSrc()
+  local ok, src = pcall(system.getSource, { category = CATEGORY_FLIGHT, member = 0 })
+  if ok then return src end
+  return nil
+end
+
 -- Function Switches (FS1-FS4) are not logic switches and have no
 -- documented CATEGORY_* constant -- confirmed via the DLGPoker project's
 -- own hardware sweep (its spec S11): asking a manually-picked FS1 source
@@ -314,6 +404,36 @@ local function getFS(member)
   return nil
 end
 
+-- Camber/reflex and Elevator are genuine Ethos trims (independent per
+-- flight mode natively -- confirmed live-tracking AND per-FM scoping via
+-- a throwaway TrimProbe tool, 2026-09-08). CATEGORY_TRIM member indices
+-- are NOT the standard AETR order on this template -- confirmed by name
+-- in the probe sweep: 0=Rudder, 1=Elevator, 2=Throttle, 3=Aileron. Throttle
+-- is repurposed for camber/reflex (the DLG template's own convention --
+-- see dlg_ethos_220_SettingsRef.xlsx's "Controls and FMs" sheet: "Throttle
+-- trim -- Camber/reflex adjustment, per flight mode"). These are
+-- READ-ONLY from Lua -- confirmed both empirically (a value() write is a
+-- silent no-op) and against FrSky's own Ethos Lua reference docs (Source
+-- class's value() write capability is documented as scoped to "Lua
+-- sources / Vars / Telemetry sensors" -- trims aren't in that list, and
+-- no model.setTrim or equivalent exists). Do not add write code for these.
+local function getTrimMember(member)
+  local ok, src = pcall(system.getSource, { category = CATEGORY_TRIM, member = member })
+  if ok then return src end
+  return nil
+end
+
+-- V_RudOffset is an Ethos model Variable (Ethos 1.5+'s own named-variable
+-- feature), not a trim -- resolves via a bare name lookup, no category,
+-- and unlike the trims above IS writable via src:value(x) (confirmed by
+-- CurveVarProbe). Only takes effect in Launch mode per the DLG template's
+-- own Mixers sheet (the "RudderOffset" mixer line is Launch-only).
+local function getVar(name)
+  local ok, src = pcall(system.getSource, { name = name })
+  if ok then return src end
+  return nil
+end
+
 local function resolveSources()
   S.altSrc    = getSensor("Altitude")
   S.callSrc   = getLogic("ALT_CALL")
@@ -322,6 +442,10 @@ local function resolveSources()
   S.fs2 = getFS(1)
   S.fs3 = getFS(2)
   S.fs4 = getFS(3)
+  S.camberSrc = getTrimMember(2)
+  S.elevSrc   = getTrimMember(1)
+  S.rudSrc    = getVar("V_RudOffset")
+  S.fmSrc     = getFlightModeSrc()
   if S.altSrc then
     local ok, u = pcall(function() return S.altSrc:stringUnit() end)
     if ok and type(u) == "string" and u ~= "" then S.unit = u end
@@ -372,6 +496,20 @@ core.loadConfig = loadConfig
 
 -- ---------------------------------------------------------------- log io
 
+-- S.baselineGrp is a pure function of the log: the group of the latest
+-- "revert" or "accept" event, 0 if there's never been one. Re-derived
+-- after anything that changes S.events (load, undo, erase, seed purge)
+-- rather than persisted as its own value -- one source of truth, and it
+-- can't drift from the log it describes.
+local function deriveBaselineGrp()
+  local g = 0
+  for i = 1, #S.events do
+    local e = S.events[i]
+    if (e.type == "revert" or e.type == "accept") and e.grp > g then g = e.grp end
+  end
+  S.baselineGrp = g
+end
+
 local function loadLog()
   S.launches, S.events = {}, {}
   local gid = core.activeGid()
@@ -401,12 +539,28 @@ local function loadLog()
         ts   = tonumber(r[1]) or 0,
         type = r[3] or "change",
         grp  = tonumber(r[4]) or 1,
+        -- Trailing columns, "setup"-type events only (2.0). Absent/blank
+        -- on every pre-2.0 row and on manual "change"/"power" rows alike --
+        -- tonumber(nil-or-"") is nil either way, so this reads back exactly
+        -- as "no delta on this axis" with no special-casing needed. Five
+        -- columns, not three -- Launch and Zoom camber/elev are tracked
+        -- independently (see core.confirmPendingSetup), so one mark event
+        -- can carry deltas for both modes plus rud all at once. Column 10,
+        -- "revertToGrp", is "type"=="revert" rows only -- which mark's own
+        -- group this row reverted back to (see core.finishRevert).
+        launchCamber = tonumber(r[5]),
+        launchElev   = tonumber(r[6]),
+        rud          = tonumber(r[7]),
+        zoomCamber   = tonumber(r[8]),
+        zoomElev     = tonumber(r[9]),
+        revertToGrp  = tonumber(r[10]),
       }
     end
   end
 
   S.sessionLaunches = 0
   S.sessionEvents   = 0
+  deriveBaselineGrp()
 end
 
 -- ---------------------------------------------------------------- grouping
@@ -444,9 +598,19 @@ function core.isArmed()
   return e ~= nil and e.type == "change" and e.grp == cur
 end
 
+-- Every event kind that opens a real current/previous-set boundary --
+-- everything except "power". "setup" (auto-detected), "revert" and
+-- "accept" count exactly like a manual "change" here, so the delta
+-- badge's fallback-to-recent-window logic (core.stats) must not fire just
+-- because the only boundary so far wasn't key-pressed.
+local function isMark(e)
+  local t = e.type
+  return t == "change" or t == "setup" or t == "revert" or t == "accept"
+end
+
 function core.hasChange()
   for i = 1, #S.events do
-    if S.events[i].type == "change" then return true end
+    if isMark(S.events[i]) then return true end
   end
   return false
 end
@@ -472,11 +636,45 @@ local function heightsIn(grp)
   return out
 end
 
+-- Average height of one specific group, flagged records excluded --
+-- exposed for Review Log's per-mark delta (this group's average vs the one
+-- right before it), which needs an arbitrary group's figure, not just the
+-- current/before pair core.stats already computes.
+function core.groupAvg(grp)
+  return mean(heightsIn(grp))
+end
+
 -- The most recent closed group that actually holds data. A group emptied by
 -- undo is skipped rather than reported as an empty Before.
 function core.beforeGroup()
   local cur = core.currentGroup()
   for g = cur - 1, 1, -1 do
+    if #heightsIn(g) > 0 then return g end
+  end
+  return nil
+end
+
+-- The set COMPARE's top row averages: the last set with throws BEFORE the
+-- first mark since baseline -- i.e. how the glider flew before any of the
+-- changes still being compared against were made. With exactly one mark
+-- since baseline this is the same set core.beforeGroup returns (hence the
+-- "Previous set" label in that case); with two or more it reaches back
+-- past all of them, which is the whole point of the "Original baseline"
+-- label. An earlier version only ever changed the LABEL and kept showing
+-- the previous set's figure underneath it regardless -- fixed 2026-09-10
+-- while building accept-as-baseline, which would otherwise have been a
+-- numeric no-op. nil when there's no mark since baseline at all (callers
+-- fall back to the previous-set / recent-window comparison as before).
+function core.baselineGroup()
+  local firstMark
+  for i = 1, #S.events do
+    local e = S.events[i]
+    if isMark(e) and e.grp > (S.baselineGrp or 0) then
+      if not firstMark or e.grp < firstMark then firstMark = e.grp end
+    end
+  end
+  if not firstMark then return nil end
+  for g = firstMark - 1, 1, -1 do
     if #heightsIn(g) > 0 then return g end
   end
   return nil
@@ -507,11 +705,27 @@ function core.stats(barCount)
   local before = bg and heightsIn(bg) or {}
   local all    = validHeights()
 
+  local marksSinceBaseline = 0
+  for i = 1, #S.events do
+    local e = S.events[i]
+    if isMark(e) and e.grp > (S.baselineGrp or 0) then
+      marksSinceBaseline = marksSinceBaseline + 1
+    end
+  end
+  local blg = core.baselineGroup()
+  local baseline = blg and heightsIn(blg) or nil
+
   local st = {
     unit      = S.unit,
     armed     = core.isArmed(),
     hasChange = core.hasChange(),
     group     = cur,
+    -- COMPARE panel label rule (2.0): exactly one mark since baseline ->
+    -- "Previous set" is accurate (it IS the one set right before this
+    -- one); two or more -> "Original baseline", since the comparison is
+    -- however many marks back to the actual baseline, not to "the set
+    -- right before this one." screen.lua reads this to pick the label.
+    marksSinceBaseline = marksSinceBaseline,
     -- Always the TRUE current/previous set, never overwritten below. The
     -- "SET n . n=" panel reads these, so they must reflect every throw
     -- actually in the set regardless of what the delta comparison ends up
@@ -580,6 +794,17 @@ function core.stats(barCount)
   if st.cmpAfterAvg and st.cmpBeforeAvg then
     st.delta = st.cmpAfterAvg - st.cmpBeforeAvg
     st.confident = (st.cmpAfterN >= 3 and st.cmpBeforeN >= 3)
+  end
+
+  -- COMPARE's top row: the genuine baseline set when there is one (see
+  -- core.baselineGroup), otherwise whatever the comparison above settled
+  -- on -- identical to cmpBeforeAvg with exactly one mark since baseline,
+  -- and with none at all. The delta badge deliberately keeps using
+  -- cmpBeforeAvg ("vs previous set") either way, matching the mockup.
+  if baseline and #baseline > 0 then
+    st.baselineAvg, st.baselineN = mean(baseline), #baseline
+  else
+    st.baselineAvg, st.baselineN = st.cmpBeforeAvg, st.cmpBeforeN
   end
 
   return st
@@ -686,6 +911,7 @@ local function purgeSeedIfPresent()
   end
   S.launches, S.events = {}, {}
   S.sessionLaunches, S.sessionEvents = 0, 0
+  deriveBaselineGrp()
   core.setStatus("sample data cleared - tracking real throws")
 end
 
@@ -698,7 +924,13 @@ function core.recordLaunch(height, unit, ts)
   unit = unit or S.unit
 
   if height < (S.cfg.floor or 25) then
-    return "low"                    -- discarded silently, armed state intact
+    -- Discarded, armed state intact -- but not silently any more (2026-09-09):
+    -- a throw genuinely clearing the floor was hard to tell apart from
+    -- one that didn't while debugging a separate capture issue, since
+    -- neither one said anything on screen. A quick status line costs
+    -- nothing and makes "did that count?" answerable at a glance.
+    core.setStatus(string.format("%d %s - below floor, not recorded", height, unit))
+    return "low"
   end
 
   -- No ceiling/ "high" flag on new throws any more -- removed at the pilot's
@@ -708,12 +940,22 @@ function core.recordLaunch(height, unit, ts)
   -- correctly rather than silently reinterpreting old data.
   local st = "ok"
 
+  -- A throw that clears the floor is, per the pilot's spec, exactly the
+  -- moment a pending auto-detected setup change gets confirmed into a
+  -- real mark -- BEFORE grp is read below, so this throw becomes the new
+  -- group's first throw (no separate "armed and waiting" gap the way a
+  -- manual MARK leaves one). A discarded "low" throw above never reaches
+  -- here, so it can't spuriously confirm a change that hasn't really been
+  -- test-flown yet.
+  core.confirmPendingSetup()
+
   local grp = core.currentGroup()
   S.seq = S.seq + 1
   local rec = { ts = ts, h = height, u = unit, grp = grp, st = st, seq = S.seq,
                 seed = false }
   S.launches[#S.launches + 1] = rec
   S.sessionLaunches = S.sessionLaunches + 1
+  S.launchJustRecorded = true
 
   appendRow("launches", { tostring(ts), core.activeGid(), tostring(height),
                           unit, tostring(grp), st, "" })
@@ -768,14 +1010,36 @@ function core.seedDemo(n, minHeight, maxHeight)
   return true
 end
 
-local function addEvent(kind)
+-- extra (optional) carries either a "setup" mark's trim/VAR deltas --
+-- {launchCamber=, launchElev=, rud=, zoomCamber=, zoomElev=}, any of which
+-- may be nil (that axis untouched); five separate fields, not three, since
+-- Launch and Zoom camber/elev are tracked independently (see
+-- core.confirmPendingSetup) -- or a "revert" row's {revertToGrp=}, which
+-- mark's own group this reverted back to (see core.finishRevert). Every
+-- other kind ("change", "power") passes no extra, so those rows' trailing
+-- columns just come out blank, same as every pre-2.0 row already on disk.
+local function addEvent(kind, extra)
   local grp = core.currentGroup() + 1
   local ts = os.time()
   S.seq = S.seq + 1
   local e = { ts = ts, type = kind, grp = grp, seq = S.seq }
+  if extra then
+    e.launchCamber = extra.launchCamber
+    e.launchElev   = extra.launchElev
+    e.rud          = extra.rud
+    e.zoomCamber   = extra.zoomCamber
+    e.zoomElev     = extra.zoomElev
+    e.revertToGrp  = extra.revertToGrp
+  end
   S.events[#S.events + 1] = e
   S.sessionEvents = S.sessionEvents + 1
-  appendRow("events", { tostring(ts), core.activeGid(), kind, tostring(grp) })
+  appendRow("events", { tostring(ts), core.activeGid(), kind, tostring(grp),
+    (extra and extra.launchCamber) and tostring(extra.launchCamber) or "",
+    (extra and extra.launchElev)   and tostring(extra.launchElev)   or "",
+    (extra and extra.rud)          and tostring(extra.rud)          or "",
+    (extra and extra.zoomCamber)   and tostring(extra.zoomCamber)   or "",
+    (extra and extra.zoomElev)     and tostring(extra.zoomElev)     or "",
+    (extra and extra.revertToGrp)  and tostring(extra.revertToGrp)  or "" })
   return e
 end
 
@@ -811,12 +1075,17 @@ end
 
 -- ---------------------------------------------------------------- undo
 
--- Most recent event of any kind, limited to this power-on session.
+-- Most recent event of any kind, limited to this power-on session. Covers
+-- "setup" (auto-detected) marks as well as manual "change" ones as of 2.0 --
+-- Review Log surfaces both kinds the same way, so a pilot who fat-fingers a
+-- setup change into an accidental early confirmation needs to be able to
+-- remove it too, not just a manual MARK.
 function core.undoTarget()
   local lastL = S.launches[#S.launches]
   local lastE = S.events[#S.events]
   local haveL = S.sessionLaunches > 0 and lastL
-  local haveE = S.sessionEvents > 0 and lastE and lastE.type == "change"
+  local haveE = S.sessionEvents > 0 and lastE
+    and (lastE.type == "change" or lastE.type == "setup" or lastE.type == "accept")
 
   if haveL and haveE then
     -- Ordered by append sequence, not timestamp: os.time() has one-second
@@ -883,6 +1152,7 @@ function core.undo()
       end
     end
     rewrite("launches", rows)
+    deriveBaselineGrp()
     core.setStatus("change removed")
   end
   return true
@@ -912,6 +1182,7 @@ function core.erase()
   end
   S.launches, S.events = {}, {}
   S.sessionLaunches, S.sessionEvents = 0, 0
+  deriveBaselineGrp()
   if system.playHaptic then pcall(system.playHaptic, 200) end
   core.setStatus("data erased")
 end
@@ -938,8 +1209,494 @@ local function srcAge(src)
 end
 
 function core.telemetryLive()
+  local limit = S.cfg.stale
+  if limit == nil then limit = 2 end
+  if limit <= 0 then return true end      -- gate switched off (CFG), see defaults()
   local age = srcAge(S.altSrc)
-  return age >= 0 and age < STALE_MS
+  return age >= 0 and age < limit * 1000
+end
+
+-- The on-screen "no telemetry" warning, debounced: true only once the
+-- feed has been stale for TELEM_WARN_SEC continuously. realCapture keeps
+-- using the strict per-read telemetryLive() above for the record gate --
+-- that's where strictness matters. This one only decides what the
+-- bottom line of Main shows, and a feed hovering right at the 2 s edge
+-- (pilot, 2026-09-10, simulator) made that line flicker between the set
+-- captions and the warning every frame. Same os.time-based dwell idea as
+-- core.status.
+local TELEM_WARN_SEC = 3
+function core.telemetryWarning()
+  if core.telemetryLive() then
+    S.staleSince = nil
+    return false
+  end
+  S.staleSince = S.staleSince or os.time()
+  return os.time() - S.staleSince >= TELEM_WARN_SEC
+end
+
+-- ---------------------------------------------------------------- setup marks (2.0)
+
+-- Two DIFFERENT things share the word "baseline" here, and confusing them
+-- was a real bug (found by the pilot, 2026-09-09): the TRIM/VAR values
+-- below (baseCamber/baseElev/baseRud) are what a new setup change gets
+-- DETECTED against, and the pilot's own spec is explicit that these
+-- reset fresh every power-on ("the settings as they stood when the
+-- transmitter powered on"). S.baselineGrp is a completely different
+-- thing -- how far back the COMPARE panel's label counts marks (see
+-- core.stats' marksSinceBaseline) -- and must NOT reset on every boot:
+-- a mark made two power-cycles ago is still exactly one mark ago for
+-- that purpose. So this function only ever touches the trim/VAR values;
+-- S.baselineGrp is derived from the log (see deriveBaselineGrp) and only
+-- moves forward when an "accept" (core.acceptBaseline) or a completed
+-- revert (core.finishRevert) logs its event. Getting this right matters:
+-- the first version of
+-- this function bumped baselineGrp here too, which meant a single reboot
+-- made a real, still-relevant mark stop counting -- exactly the "shows
+-- Original baseline for what's really just one mark" bug.
+-- Seconds after a (re)baseline before the rudder-offset baseline is
+-- actually read. Same settling window identityStillCurrent documents for
+-- model.id(): right after power-on, sources can briefly read unsettled
+-- values. Pilot-reported 2026-09-10: after a restart with V_RudOffset
+-- genuinely sitting at +5, the app showed a phantom "+5 pending" -- an
+-- eager init-time read had captured 0 as the baseline. Camber/elev never
+-- hit this because their baselines are captured lazily on the first
+-- Launch visit; this gives rud an equivalent delay (core.wakeup does the
+-- deferred read).
+local RUD_SETTLE_SEC = 2
+
+function core.captureSetupBaseline()
+  S.baseCamberByFM = {}
+  S.baseElevByFM   = {}
+  -- rud is readable any time (a Variable, not a trim -- see the state
+  -- table comment), so it doesn't wait for a flight mode -- but it does
+  -- wait for the radio to settle, see RUD_SETTLE_SEC above.
+  S.baseRud = nil
+  S.rudBaselineAt = os.time() + RUD_SETTLE_SEC
+  S.pendingByFM = {}
+  S.pendingRud  = nil
+end
+
+function core.currentFlightMode()
+  local v = srcValue(S.fmSrc)
+  if type(v) ~= "number" then return nil end
+  return v
+end
+
+function core.hasPendingSetup()
+  return S.pendingByFM[FM_LAUNCH] ~= nil or S.pendingByFM[FM_ZOOM] ~= nil or S.pendingRud ~= nil
+end
+
+-- Confirmed drift THIS SESSION: every "setup" mark's deltas since the
+-- last power-on, summed per axis, plus how many such marks there were.
+-- This is what the CHANGES screen shows under/behind any pending delta.
+-- Pilot's call, 2026-09-10, after two rounds: pending-only read "+0
+-- everywhere" right after a confirmed change, and "since the COMPARE
+-- baseline" (the first replacement) surprised them by still showing
+-- yesterday's drift after a reload -- the power-on baseline is the
+-- reference the pilot actually thinks in, and it's the same reference
+-- the pending (blue) part already uses. Session boundary = the latest
+-- "power" event (core.init logs one whenever there's history); with no
+-- power event on record every mark is this session's. Pending,
+-- unconfirmed deltas are deliberately NOT included -- callers stack
+-- those on top so the two stay visually distinct. The COMPARE baseline
+-- (S.baselineGrp, ACCEPT/revert) is a separate question and untouched.
+function core.driftThisSession()
+  -- Since the latest power-on, accept OR revert -- after either of the
+  -- last two the setup is the baseline again (see core.sessionBaselineGrp).
+  local since = core.sessionBaselineGrp()
+  local d = { launchCamber = 0, launchElev = 0, rud = 0, zoomCamber = 0, zoomElev = 0 }
+  local n = 0
+  for i = 1, #S.events do
+    local e = S.events[i]
+    if e.type == "setup" and e.grp > since then
+      n = n + 1
+      for k in pairs(d) do
+        if e[k] then d[k] = d[k] + e[k] end
+      end
+    end
+  end
+  return d, n
+end
+
+-- Reads and clears the "a change just became pending" edge in one step, so
+-- two callers can never both see it true. screen.lua calls this from its
+-- own paint(); nothing else should touch S.setupJustDetected directly.
+function core.consumeSetupJustDetected()
+  local v = S.setupJustDetected
+  S.setupJustDetected = false
+  return v
+end
+
+-- Same read-and-clear shape for "a throw was just recorded" -- screen.lua
+-- uses it to return to Main after any throw (pilot's call 2026-09-10).
+function core.consumeLaunchRecorded()
+  local v = S.launchJustRecorded
+  S.launchJustRecorded = false
+  return v
+end
+
+-- Called every wakeup. Camber/elev are watched per-FM: whichever mode is
+-- CURRENTLY active gets its baseline captured lazily (the first tick it's
+-- ever seen active after a reset) and its own delta computed -- the OTHER
+-- mode's already-detected pending delta (if any) is left untouched, so
+-- both can show as pending at once, matching the approved Setup Change
+-- Detected mockup's two independent Launch/Zoom cards. rud is only
+-- watched while in Launch specifically (it only ever takes effect there
+-- -- see the Mixers sheet), even though it could technically be READ from
+-- any mode. Outside Launch/Zoom entirely, this does nothing at all --
+-- whatever's already pending just sits there, since the underlying trim/
+-- VAR values don't revert just because flight mode changed.
+function core.pollSetupChange()
+  if not S.ready then return end
+  local fm = core.currentFlightMode()
+  if fm ~= FM_LAUNCH and fm ~= FM_ZOOM then return end
+
+  local hadPending = core.hasPendingSetup()
+
+  local camber = srcValue(S.camberSrc)
+  local elev   = srcValue(S.elevSrc)
+
+  if S.baseCamberByFM[fm] == nil then S.baseCamberByFM[fm] = camber end
+  if S.baseElevByFM[fm]   == nil then S.baseElevByFM[fm]   = elev   end
+
+  local baseCamber, baseElev = S.baseCamberByFM[fm], S.baseElevByFM[fm]
+  local dCamber = (type(camber) == "number" and type(baseCamber) == "number" and camber - baseCamber ~= 0) and (camber - baseCamber) or nil
+  local dElev   = (type(elev)   == "number" and type(baseElev)   == "number" and elev   - baseElev   ~= 0) and (elev   - baseElev)   or nil
+
+  S.pendingByFM[fm] = (dCamber or dElev) and { camber = dCamber, elev = dElev } or nil
+
+  if fm == FM_LAUNCH then
+    local rud = srcValue(S.rudSrc)
+    local dRud = (type(rud) == "number" and type(S.baseRud) == "number" and rud - S.baseRud ~= 0) and (rud - S.baseRud) or nil
+    S.pendingRud = dRud
+  end
+
+  if core.hasPendingSetup() and not hadPending then
+    S.setupJustDetected = true
+  end
+end
+
+-- Called from core.recordLaunch, right before that throw is grouped --
+-- see the call site for why this specific injection point makes the
+-- confirming throw itself the new group's first throw, with no separate
+-- "armed and waiting" gap the way a manual MARK has. Gathers whatever's
+-- pending across BOTH flight modes plus rud into ONE mark event -- a
+-- single confirming throw closes out everything detected so far, not just
+-- whichever mode happened to be active at that exact moment. Re-baselines
+-- every axis that had a pending delta to the value it was detected at, so
+-- a further, unrelated drift after this throw is measured from here, not
+-- from the pre-mark baseline. An axis with nothing pending keeps its
+-- existing baseline untouched.
+function core.confirmPendingSetup()
+  if not core.hasPendingSetup() then return end
+  local pLaunch = S.pendingByFM[FM_LAUNCH]
+  local pZoom   = S.pendingByFM[FM_ZOOM]
+
+  addEvent("setup", {
+    launchCamber = pLaunch and pLaunch.camber,
+    launchElev   = pLaunch and pLaunch.elev,
+    rud          = S.pendingRud,
+    zoomCamber   = pZoom and pZoom.camber,
+    zoomElev     = pZoom and pZoom.elev,
+  })
+
+  -- Re-baseline each confirmed axis to the value it was detected AT
+  -- (baseline + delta), NOT a live trim read gated on being in that mode:
+  -- the confirming throw always arrives after the model has already left
+  -- Launch/Zoom (ALT_CALL only fires once it has -- see the template's
+  -- own LSW24), so a mode-gated live read never ran, the old baseline
+  -- stayed put, and the very next visit to that mode re-detected the same
+  -- delta as a brand-new change -- a duplicate mark on every following
+  -- throw. Caught by the execution harness 2026-09-10. Rud below never had
+  -- this problem (a VAR, readable any time) and is unchanged.
+  for _, fm in ipairs({ FM_LAUNCH, FM_ZOOM }) do
+    local pend = S.pendingByFM[fm]
+    if pend then
+      if pend.camber and S.baseCamberByFM[fm] then
+        S.baseCamberByFM[fm] = S.baseCamberByFM[fm] + pend.camber
+      end
+      if pend.elev and S.baseElevByFM[fm] then
+        S.baseElevByFM[fm] = S.baseElevByFM[fm] + pend.elev
+      end
+      S.pendingByFM[fm] = nil
+    end
+  end
+  if S.pendingRud then
+    S.baseRud = srcValue(S.rudSrc) or S.baseRud
+    S.pendingRud = nil
+  end
+  haptic(60)
+end
+
+-- "Accept current setup as baseline" (2026-09-10, the last item from the
+-- original 2.0 spec): nothing about the trims/VAR changes -- this only
+-- moves the COMPARE baseline forward to right now, so the marks made so
+-- far stop counting as "changes still under evaluation" and the next
+-- mark compares against THIS setup's flying, not the original one.
+-- Logged as its own "accept" event: that's what persists it (see
+-- deriveBaselineGrp), gives it a Review Log row, and opens a fresh set
+-- boundary like every other mark so post-accept throws read as their own
+-- set. Refuses while a setup change is still pending unconfirmed -- that
+-- would quietly bless a change no throw has tested yet, exactly what the
+-- throw-confirms rule exists to prevent -- and while a manual MARK is
+-- armed with no throws under it, which would just orphan an empty set.
+-- Returns true on success; the caller shows the status either way.
+function core.acceptBaseline()
+  if core.hasPendingSetup() then
+    core.setStatus("throw to confirm the pending change first")
+    return false
+  end
+  if core.isArmed() then
+    core.setStatus("cancel or fly the pending MARK first")
+    return false
+  end
+  local e = addEvent("accept")
+  S.baselineGrp = e.grp
+  haptic(60)
+  core.setStatus("current setup accepted as baseline")
+  return true
+end
+
+-- ---------------------------------------------------------------- revert (2.0)
+
+-- The "last known" value for a per-flight-mode trim axis, whether or not
+-- that mode is the one currently active -- a trim's :value() only ever
+-- reflects whichever mode is live right now (TrimProbe-confirmed scoping,
+-- see project memory), so the OTHER mode's card on the Reverting screen has
+-- to fall back to whatever was last captured for it (baseline + any still-
+-- pending delta) rather than a fresh read. Equals a genuinely live read
+-- whenever fm IS the active mode, since core.pollSetupChange keeps that
+-- mode's baseline/pending current on every wakeup regardless of which
+-- screen is showing.
+function core.currentAxisValue(fm, axis)
+  local base = (axis == "camber") and S.baseCamberByFM[fm] or S.baseElevByFM[fm]
+  if base == nil then return nil end
+  local pending = S.pendingByFM[fm]
+  local pendingDelta = pending and pending[axis]
+  return base + (pendingDelta or 0)
+end
+
+-- Rudder offset is the one axis this app can actually edit directly --
+-- confirmed read-write via CurveVarProbe, unlike the two trims (read-only
+-- from Lua, see the Write path section above). Exposed for the Setup
+-- Change Detected screen's own rotary handling (2026-09-09, pilot's own
+-- request: a manual CHANGES key plus in-app editing, rather than needing
+-- the radio's separate VARs config page). This is a genuine live edit,
+-- not a revert -- core.pollSetupChange picks up the resulting difference
+-- from baseline on its own next poll exactly like an external edit would,
+-- and it still needs a throw to confirm it into an official mark, same as
+-- always. No baseline touched here -- letting the ordinary detection path
+-- see the change is the whole point, not bypassing it.
+function core.nudgeRud(delta)
+  if not S.rudSrc then return end
+  local cur = srcValue(S.rudSrc)
+  if type(cur) ~= "number" then return end
+  pcall(function() S.rudSrc:value(cur + delta) end)
+end
+
+-- What reverting to `mark` (a "setup" event) would mean for each axis, right
+-- now: core.lua only ever stores each mark's own DELTA, never an absolute
+-- snapshot, so the target has to be reconstructed as "current known value,
+-- minus every later mark's delta for that same axis" -- which only needs
+-- data already on hand (no historical baseline lookup), because a trim/VAR's
+-- real value persists across power cycles even though S.baseCamberByFM
+-- itself gets re-captured fresh every boot (see core.captureSetupBaseline).
+-- Deliberately checks ALL FOUR camber/elev slots, not just the ones `mark`
+-- itself touched -- if a LATER mark also changed an axis this one never
+-- did, reverting to this point in history has to undo that later change
+-- too, not just replay this mark's own recorded fields. An axis with no
+-- net change since `mark` (sumAfter == 0) is omitted -- nothing to revert.
+local function revertTargetsSince(sinceGrp, includePending)
+  local specs = {
+    { field = "launchCamber", fm = FM_LAUNCH, axis = "camber", label = "Camber" },
+    { field = "launchElev",   fm = FM_LAUNCH, axis = "elev",   label = "Elevator" },
+    { field = "zoomCamber",   fm = FM_ZOOM,   axis = "camber", label = "Camber" },
+    { field = "zoomElev",     fm = FM_ZOOM,   axis = "elev",   label = "Elevator" },
+  }
+  local function differs(a, b) return math.floor(a + 0.5) ~= math.floor(b + 0.5) end
+  local out = {}
+  for i = 1, #specs do
+    local s = specs[i]
+    local sumAfter = 0
+    for j = 1, #S.events do
+      local e = S.events[j]
+      if e.type == "setup" and e.grp > sinceGrp and e[s.field] then
+        sumAfter = sumAfter + e[s.field]
+      end
+    end
+    local current = core.currentAxisValue(s.fm, s.axis)
+    if current ~= nil then
+      local pend = S.pendingByFM[s.fm]
+      local pd = (includePending and pend and pend[s.axis]) or 0
+      local target = current - sumAfter - pd
+      if differs(target, current) then
+        out[#out + 1] = { fm = s.fm, axis = s.axis, label = s.label,
+                           current = current, target = target }
+      end
+    end
+  end
+
+  -- Rudder offset has no per-FM split (a Variable, readable any time) and
+  -- is writable, so its target isn't gated on a flight mode being visited.
+  local rudSumAfter = 0
+  for j = 1, #S.events do
+    local e = S.events[j]
+    if e.type == "setup" and e.grp > sinceGrp and e.rud then
+      rudSumAfter = rudSumAfter + e.rud
+    end
+  end
+  local current = srcValue(S.rudSrc)
+  if current ~= nil then
+    local pd = (includePending and S.pendingRud) or 0
+    local target = current - rudSumAfter - pd
+    if differs(target, current) then
+      out[#out + 1] = { fm = FM_LAUNCH, axis = "rud", label = "Rudder offset",
+                         current = current, target = target }
+    end
+  end
+  return out
+end
+
+-- Revert to a specific confirmed mark: undo every LATER confirmed mark.
+-- A still-pending delta is left alone -- it hasn't been confirmed into
+-- anything yet, and the next throw will handle it either way.
+function core.revertTargetsFor(mark)
+  return revertTargetsSince(mark.grp, false)
+end
+
+-- The group the CHANGES screen measures "since baseline" from: the latest
+-- power-on, accept or revert event (0 if none). Power-on because the
+-- pilot thinks in "what did I change today"; accept/revert because after
+-- either the setup IS the baseline again, whatever happened earlier in
+-- the session. Both core.driftThisSession and revertTargetsToBaseline
+-- key off this so the pills and REVERT can never disagree.
+function core.sessionBaselineGrp()
+  local g = 0
+  for i = 1, #S.events do
+    local e = S.events[i]
+    local t = e.type
+    if (t == "power" or t == "accept" or t == "revert") and e.grp > g then g = e.grp end
+  end
+  return g
+end
+
+-- Revert to baseline (the CHANGES screen's REVERT key, pilot's request
+-- 2026-09-10): undo everything since sessionBaselineGrp -- confirmed marks
+-- AND any still-pending delta, since the pilot's intent is "put it all
+-- back", not "put back only what a throw has blessed".
+function core.revertTargetsToBaseline()
+  return revertTargetsSince(core.sessionBaselineGrp(), true)
+end
+
+-- Snapshots revertTargetsFor(mark) ONCE into S.revertTarget -- the fixed
+-- reference the Reverting screen compares against -- and, for rudder
+-- offset specifically, writes the target immediately (confirmed
+-- read-write via CurveVarProbe; trims are not, see project memory), since
+-- that's the one axis this app can actually finish on the pilot's behalf.
+-- Re-baselines rud right away too, so core.pollSetupChange doesn't see its
+-- own write as a brand-new pending change on the very next wakeup.
+-- Idempotent -- calling this again (e.g. re-entering Revert Confirm for
+-- the same mark after backing out) just recomputes and overwrites.
+function core.beginRevert(mark)
+  local targets = mark.toBaseline and core.revertTargetsToBaseline() or core.revertTargetsFor(mark)
+  local axes, rud = {}, nil
+  for i = 1, #targets do
+    local t = targets[i]
+    if t.axis == "rud" then rud = t else axes[#axes + 1] = t end
+  end
+  S.revertTarget = { grp = mark.grp, ts = mark.ts, axes = axes, rud = rud,
+                     toBaseline = mark.toBaseline or false }
+  if rud then
+    local ok = pcall(function() S.rudSrc:value(rud.target) end)
+    if ok then S.baseRud = rud.target end
+  end
+end
+
+-- Live per-axis current-vs-target, read fresh every call (unlike the fixed
+-- targets themselves) so the Reverting screen can show real-time progress
+-- as the pilot's own trim taps close the gap. Matching is compared as
+-- whole numbers -- every value this feature deals with is already a
+-- whole-number trim/VAR reading (see the mockup's own "+2"/"+4"-style
+-- figures), so this avoids a false non-match from float noise.
+function core.revertProgress()
+  if not S.revertTarget then return nil end
+  local function roundEq(a, b)
+    return a ~= nil and b ~= nil and math.floor(a + 0.5) == math.floor(b + 0.5)
+  end
+  local out = { axes = {} }
+  for i = 1, #S.revertTarget.axes do
+    local a = S.revertTarget.axes[i]
+    local current = core.currentAxisValue(a.fm, a.axis)
+    out.axes[#out.axes + 1] = { fm = a.fm, axis = a.axis, label = a.label,
+      current = current, target = a.target, matched = roundEq(current, a.target) }
+  end
+  if S.revertTarget.rud then
+    local r = S.revertTarget.rud
+    local current = srcValue(S.rudSrc)
+    out.rud = { label = r.label, current = current, target = r.target,
+                matched = roundEq(current, r.target) }
+  end
+  return out
+end
+
+-- True once every trim axis in the current revert reads its target --
+-- screen.lua polls this to decide when to auto-close back to Main. Rud
+-- isn't checked here: it was already written (and re-baselined) the
+-- instant core.beginRevert ran, so it can only ever fail to match if the
+-- write itself silently failed, in which case there is nothing further
+-- for the pilot to physically do about it anyway.
+function core.revertAllMatched()
+  local p = core.revertProgress()
+  if not p then return false end
+  for i = 1, #p.axes do
+    if not p.axes[i].matched then return false end
+  end
+  return true
+end
+
+-- Called once core.revertAllMatched() goes true. Logs a "revert" mark (a
+-- real group boundary, same as any other mark -- pilot's own call,
+-- 2026-09-09: post-revert throws should read as their own set, not get
+-- lumped in with the throws taken under the since-corrected settings) and
+-- moves S.baselineGrp forward to it, so COMPARE's "how many marks back"
+-- label counts fresh from here (the dialog's own "this starts a new
+-- baseline from here"). Also re-baselines every axis THIS revert actually
+-- touched to its final (now-matching) value and clears any leftover
+-- pending delta for just those flight modes -- otherwise the very next
+-- throw would immediately re-confirm the same physical change a second
+-- time as a brand-new "setup" mark. Deliberately scoped to only the FMs
+-- this revert touched, not both unconditionally: an unrelated pending
+-- change already sitting in the OTHER mode (nothing to do with this
+-- revert) must survive, not get silently discarded here.
+function core.finishRevert()
+  if not S.revertTarget then return end
+  local finals, touchedFMs = {}, {}
+  for i = 1, #S.revertTarget.axes do
+    local a = S.revertTarget.axes[i]
+    finals[#finals + 1] = { fm = a.fm, axis = a.axis, value = core.currentAxisValue(a.fm, a.axis) }
+    touchedFMs[a.fm] = true
+  end
+
+  local e = addEvent("revert", { revertToGrp = S.revertTarget.grp })
+  S.baselineGrp = e.grp
+
+  for i = 1, #finals do
+    local f = finals[i]
+    if f.value ~= nil then
+      if f.axis == "camber" then S.baseCamberByFM[f.fm] = f.value
+      else S.baseElevByFM[f.fm] = f.value end
+    end
+  end
+  for fm in pairs(touchedFMs) do S.pendingByFM[fm] = nil end
+
+  S.revertTarget = nil
+  -- Discard any edge the revert's own trim-matching adjustments raised --
+  -- see core.consumeSetupJustDetected's own comment; without this, backing
+  -- out to Main right after a completed revert could immediately bounce
+  -- straight into Setup Change Detected for what's actually already-
+  -- resolved, stale state from mid-revert, not a genuine new change.
+  core.consumeSetupJustDetected()
+  haptic(60)
 end
 
 -- Launch height is the sensor's running peak read on the ALT_CALL rising
@@ -1017,12 +1774,13 @@ local function pollSwitches()
   if us and switchRose(us, "prevUndo") then fireUndoFlick() end
 end
 
--- Hardware FS1-FS4, matching the on-screen CHANGE/UNDO/LOG/CONFIG key row
--- 1:1. This only does the edge-detection and reports which one (if any)
--- rose this tick -- the focus/visibility gate and the actual dispatch live
--- in main.lua's widgetWakeup, which is the layer that actually knows about
--- screen.lua and can check whether this widget instance is the one
--- currently on screen.
+-- Hardware FS1-FS4, matching the on-screen key row 1:1 -- whatever that
+-- row currently holds (all 4 slots filled as of 2.0). This only does the
+-- edge-detection and reports which one (if any) rose this tick -- the
+-- focus/visibility gate and the actual dispatch live in main.lua's
+-- widgetWakeup, which is the layer that actually knows about screen.lua
+-- and can check whether this widget instance is the one currently on
+-- screen.
 function core.pollFS()
   if switchRose(S.fs1, "prevFS1") then return 1 end
   if switchRose(S.fs2, "prevFS2") then return 2 end
@@ -1073,6 +1831,11 @@ function core.init()
   if #S.launches > 0 and not core.isArmed() then
     addEvent("power")
   end
+  -- Fresh trim/VAR baseline every boot, per the pilot's own spec -- see
+  -- core.captureSetupBaseline's comment for why this does NOT also touch
+  -- S.baselineGrp (the COMPARE label's mark count, which must survive a
+  -- reboot untouched).
+  core.captureSetupBaseline()
   S.ready = true
 end
 
@@ -1089,9 +1852,56 @@ function core.wakeup()
   if not identityStillCurrent() then
     local fresh = bindIdentity()
     loadIdentityData(fresh)
+    core.captureSetupBaseline()
   end
+
+  -- Defensive re-resolution for EVERY source resolveSources() sets, not
+  -- just the four 2.0 ones -- mirrors identityStillCurrent's own
+  -- established reasoning just above (model.id() can return a
+  -- not-yet-settled value in the first moment or two after power-on): a
+  -- source that failed to resolve at core.init() time never got a second
+  -- chance before this fix, since resolveSources() used to only ever run
+  -- once. Confirmed as a real bug 2026-09-09, twice over: first for
+  -- rudder offset specifically (resolved via a bare getVar name lookup,
+  -- while camber/elev resolve via CATEGORY_TRIM + member index -- a
+  -- different code path that happened to work), then -- after the first
+  -- fix only widened this to the four 2.0 sources -- for altSrc/callSrc
+  -- too: an entire test session's real throws silently never got
+  -- captured at all (every row in Review Log turned out to be original
+  -- seed data, not a single real capture since boot), consistent with
+  -- ALT_CALL (S.callSrc) having failed that same one-shot resolution and
+  -- realCapture's own `if type(call) ~= "number" then return end` guard
+  -- silently discarding every throw for the rest of the session as a
+  -- result. Widened to cover every 1.4.0 AND 2.0 source resolveSources()
+  -- touches, not just the newest ones -- the failure mode isn't specific
+  -- to any one source, so the fix shouldn't be either. Cheap once
+  -- everything's actually resolved (eight already-true boolean checks),
+  -- and backfills rud's OWN baseline the moment it newly resolves rather
+  -- than a full captureSetupBaseline() call, which would also wipe out
+  -- any OTHER axis's already-legitimate pending delta. Camber/elev need
+  -- no equivalent backfill even if THEY were the ones that failed to
+  -- resolve -- their baselines are captured lazily inside
+  -- core.pollSetupChange itself the next time that flight mode is
+  -- visited, not eagerly the way rud's is. altSrc/callSrc/launchSrc need
+  -- no backfill of any kind -- realCapture just starts working the very
+  -- next tick once they're no longer nil.
+  if not (S.camberSrc and S.elevSrc and S.rudSrc and S.fmSrc
+          and S.altSrc and S.callSrc and S.launchSrc
+          and S.fs1 and S.fs2 and S.fs3 and S.fs4) then
+    resolveSources()
+  end
+
+  -- Deferred rudder-offset baseline (see RUD_SETTLE_SEC): read once the
+  -- settling window after the last captureSetupBaseline has passed. Also
+  -- naturally covers a rudSrc that only resolved on a retry above -- it
+  -- just gets read whenever it first exists after the window.
+  if S.baseRud == nil and S.rudSrc and os.time() >= (S.rudBaselineAt or 0) then
+    S.baseRud = srcValue(S.rudSrc)
+  end
+
   realCapture()
   pollSwitches()
+  core.pollSetupChange()
 end
 
 return core

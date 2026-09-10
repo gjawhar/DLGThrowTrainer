@@ -49,8 +49,16 @@ local function widgetCreate()
   if not ok then core.setStatus("init error: " .. tostring(err)) end
   return {
     app = screen.new({
-      keys       = { "CHANGE", "UNDO", "LOG", "CONFIG" },
-      dialogs    = false,   -- UNDO still double-presses rather than a dialog
+      -- UNDO removed 2026-09-09 -- MARK's own toggle already cancels a
+      -- pending change; "remove the last throw/mark outright" moved into
+      -- Review Log instead of staying a dedicated key. That freed FS4,
+      -- given back the same day to CHANGES -- a manual way into the Setup
+      -- Change Detected screen (see screen.lua's KEY_LABEL and activate())
+      -- so a pilot can view/edit current setup deltas without an actual
+      -- pending change to trigger it first. All four FS1-FS4 now map to a
+      -- real key -- see screen.lua's KEY_SLOTS.
+      keys       = { "CHANGE", "LOG", "CONFIG", "SETUP" },
+      dialogs    = false,
       needsFocus = true,    -- keys are dimmed until the widget has focus
     }),
   }
@@ -87,7 +95,7 @@ local function widgetWakeup(widget)
   local ok, err = pcall(core.wakeup)
   if not ok then core.setStatus("wakeup error: " .. tostring(err)) end
 
-  -- Hardware FS1-FS4, mirroring CHANGE/UNDO/LOG/CONFIG 1:1. None of them
+  -- Hardware FS1-FS4, mirroring the on-screen key row 1:1. None of them
   -- act until THIS widget instance is confirmed to be the visible, focused
   -- one on screen (pilot's explicit request, 2026-09) -- otherwise bumping
   -- any of FS1-4 anywhere else in the radio would quietly act on Throw

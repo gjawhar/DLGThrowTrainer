@@ -53,6 +53,10 @@ local function darkPalette()
     dimBg   = C(42, 42, 42),
     armed   = C(240, 190, 60),
     marker  = C(230, 130, 40),   -- "change" boundary + its caption
+    accentBg = C(30, 44, 61),    -- changed-axis pill fill, Setup Change
+                                  -- Detected / Reverting screens (2.0) --
+                                  -- matches the approved mockup's own
+                                  -- --accent-soft dark value (#1E2C3D).
   }
 end
 
@@ -74,6 +78,8 @@ local function lightPalette()
     dimBg   = C(222, 222, 226),
     armed   = C(195, 135, 15),
     marker  = C(195, 95, 25),
+    accentBg = C(229, 238, 248),  -- matches the approved mockup's own
+                                    -- --accent-soft light value (#E5EEF8).
   }
 end
 

@@ -47,6 +47,14 @@ function config.build(onErase, onDone)
   line = panel:addLine("Comparison window")
   num(line, 3, 200, "window", "throws")
 
+  -- Seconds since the last Altitude update before a throw is refused as
+  -- "stale telemetry". 0 switches the gate off -- meant for the simulator,
+  -- where injected frames don't keep the sensor's age fresh reliably;
+  -- leave the default on a real radio, it's what stops a dead sensor's
+  -- frozen peak being logged as a throw.
+  line = panel:addLine("Stale telemetry limit (0=off)")
+  num(line, 0, 30, "stale", "s")
+
   -- Controls ----------------------------------------------------------------
   panel = form.addExpansionPanel("Controls")
 
