@@ -22,7 +22,8 @@ scripts/ThrowTrn/
 ├── main.lua      -- registers the widget, wires all modules together
 ├── core.lua      -- state, persistence, capture, grouping, statistics
 ├── draw.lua      -- all rendering (shared by both the Full and Half sizes)
-├── screen.lua    -- the interactive app surface (main page, log page, keys)
+├── screen.lua    -- the interactive app surface (main, CHANGES, revert,
+                     review log, keys)
 ├── config.lua    -- the Settings form
 └── Files/        -- runtime data lives here (launches.csv, events.csv,
                      gliders.csv, config.csv) -- ships with a .gitkeep,
@@ -187,11 +188,26 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
   display as "n=2" because the fallback comparison window only fit 2 per
   side. Do not re-merge these.
 - **Soft key identifiers vs. labels are separate.** The widget's keys
-  array is `{"CHANGE", "UNDO", "LOG", "CONFIG"}` internally (matches
+  array is `{"CHANGE", "LOG", "CONFIG", "SETUP"}` internally (matches
   `core.change()` etc., and 1:1 with FS1-FS4), but displayed labels are
-  remapped via `KEY_LABEL` in `screen.lua` (CHANGE → "MARK", CONFIG →
-  "CFG"). If you rename a key's *label* again, do it in that map, not by
+  remapped via `KEY_LABEL` in `screen.lua` (CHANGE → "MARK", LOG →
+  "REVIEW LOG", CONFIG → "CFG", SETUP → "CHANGES"). UNDO stopped being a
+  key in 2.0 — it lives inside Review Log (ENTER on the newest entry,
+  twice). If you rename a key's *label* again, do it in that map, not by
   renaming the identifier everywhere.
+- **2.0 auto-detected setup marks** (core.lua's "setup marks" section and
+  screen.lua's CHANGES / REVERT_CONFIRM / REVERTING screens): trims are
+  read via `CATEGORY_TRIM` members 2 (Throttle = camber/reflex) and 1
+  (Elevator), read-only, per flight mode; `V_RudOffset` is a writable
+  VAR; flight mode via `CATEGORY_FLIGHT` member 0 (Launch = 2, Zoom = 3).
+  events.csv is 10 columns (deltas + revertToGrp); pre-2.0 4-column rows
+  load unchanged. The rudder-offset baseline is read 2 s after boot
+  because the VAR reads 0 for the first moments after power-on.
+- **Run `python3 harness/run.py` before every deploy** — a lupa-driven
+  suite (mocked Ethos globals, the real require chain) that executes the
+  actual widget code. It found the duplicate-mark bug the simulator
+  didn't. `harness/sim/ThrowSim/` is a simulator macro that injects
+  VariADV altitude frames for testing capture.
 - **CSV schema has a trailing `seed` column** on launch rows (`"1"` or
   `""`). Sample/demo data seeded via Config → Data → "Seed sample data" is
   flagged this way and auto-purges itself the moment a genuine throw comes

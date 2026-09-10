@@ -18,6 +18,11 @@ whether the difference is just throw-to-throw noise.
   key, and the widget compares your current set's average against the
   previous one. With no mark ever pressed, it falls back to a
   recent-vs-earlier window split of the same ongoing set.
+- **Automatic setup marks (2.0).** Adjust camber/reflex or elevator trim
+  in Launch or Zoom mode, or the rudder offset, and the widget notices.
+  Your next throw that clears the minimum height confirms the change as a
+  mark, with the actual trim deltas recorded against it, so you never have
+  to remember to press MARK after a field tweak.
 - Day (light) or Night (dark) theme — defaults to Day, since most flying
   happens outdoors.
 - A fresh install starts with a small demo data set (including a sample
@@ -43,26 +48,53 @@ above.
 
 ## Controls (Full layout only)
 
-The top row of keys — **MARK / UNDO / LOG / CFG** — lines up with your
-radio's FS1–FS4 function switches, so you can use either the physical
-switches or the on-screen keys (rotary + ENTER, or tapping directly on a
-touch-capable radio like the X20RS). None of it responds until the widget
-is the visible, focused thing on your screen — a stray press or switch
-flick elsewhere never affects it.
+The top row of keys — **MARK / REVIEW LOG / CFG / CHANGES** — lines up
+with your radio's FS1–FS4 function switches, so you can use either the
+physical switches or the on-screen keys (rotary + ENTER, or tapping
+directly on a touch-capable radio like the X20RS). None of it responds
+until the widget is the visible, focused thing on your screen — a stray
+press or switch flick elsewhere never affects it.
 
-- **MARK** — record a setup change. Press again before any throw lands
-  under it to cancel.
-- **UNDO** — remove the last throw or mark. Press twice to confirm (no
-  confirmation dialog on a widget — two presses stands in for one).
-- **LOG** — see every recorded throw, newest first.
+- **MARK** — record a setup change by hand. Press again before any throw
+  lands under it to cancel.
+- **REVIEW LOG** — every throw and mark, newest first, with the trim
+  deltas each auto-detected mark carried. ENTER on the newest entry
+  removes it (press again to confirm — this replaces the old UNDO key).
+  ENTER on an older auto-detected mark offers to revert your trims to it.
 - **CFG** — open Settings without leaving the widget.
+- **CHANGES** — the current setup: trim and rudder-offset drift since
+  power-on for Launch and Zoom, plus:
+  - **ACCEPT** — take the current setup as the new baseline.
+  - **REVERT** — walk you back to the baseline (or to a mark chosen from
+    the log) one trim at a time, telling you which trim to move, which
+    way, and by how much, and confirming when everything matches.
+  - **RUD OFFSET** — edit the rudder offset with the rotary without
+    leaving the widget.
+
+When a setup change is detected mid-session the CHANGES screen opens by
+itself, and every throw returns you to the main screen.
+
+## What the widget needs from your model
+
+Throw Trainer reads Mike Shellim's "DLG for Ethos" template by name. On
+the model it must find:
+
+- a telemetry sensor named **`Altitude`** (the vario), and
+- logic switches named **`ALT_CALL`** and **`MOM_LAUNCH`**.
+
+Auto-detected setup marks additionally use the **`V_RudOffset`** variable
+and the template's Throttle (camber/reflex) and Elevator trims. If any of
+these are renamed on your model, throws or changes silently stop
+registering — check the names before assuming the widget is broken.
 
 ## Settings
 
 Press **CFG**, or long-press the widget on a model screen (native Ethos
 "Configure" option, or the widget's own "Throw Trainer settings" menu
 entry — all three reach the same form) for: minimum height, comparison
-window size, bar count, and theme.
+window size, stale-telemetry limit (how old the altitude reading may be
+before a throw is refused; 0 switches the check off, mainly for the
+simulator), bar count, and theme.
 
 **Known limitation:** switch-type config fields (CHANGE/UNDO switch
 assignment) do not currently survive a reboot — see `CLAUDE.md` for why
