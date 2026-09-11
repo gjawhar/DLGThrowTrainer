@@ -14,6 +14,9 @@ OPTION_SENSOR_MAX = 99
 FONT_XS, FONT_S, FONT_M, FONT_L, FONT_XL = 0, 1, 2, 3, 4
 SOLID, DOTTED = 0, 1
 KEY_ROTARY_RIGHT, KEY_ROTARY_LEFT, KEY_ENTER_BREAK, KEY_RTN_FIRST, KEY_EXIT_FIRST = 11, 12, 13, 14, 15
+-- Real 26.1.2 values (Dial In probe): a tap is TOUCH_START then TOUCH_END.
+EVT_KEY, EVT_TOUCH = 0, 1
+TOUCH_START, TOUCH_END, TOUCH_MOVE, TOUCH_LONG = 16640, 16641, 16642, 16643
 
 -- Controllable source values. rud is writable (a VAR); trims are not.
 -- camber/elev are PER FLIGHT MODE, like the real trims (TrimProbe-confirmed):
@@ -309,6 +312,22 @@ throw(88)
 check(app.V.screen == 1, "a throw returns to MAIN from the done state (screen=" .. app.V.screen .. ")")
 last = core.S.events[#core.S.events]
 check(last and last.type == "revert", "revert event logged (" .. tostring(last and last.type) .. ")")
+
+print("\n-- touch: only TOUCH_END acts, and a screen-changing key can't see its own tap's other phases")
+tick()
+local kr = app.V.keyRects[4]
+check(kr ~= nil, "CHANGES key rect recorded by paint")
+if kr then
+  local cx, cy = kr.x + kr.w / 2, kr.y + kr.h / 2
+  app.event(TOUCH_START, cx, cy, EVT_TOUCH); tick()
+  check(app.V.screen == 1, "press phase alone does nothing (screen=" .. app.V.screen .. ")")
+  app.event(TOUCH_END, cx, cy, EVT_TOUCH); tick()
+  check(app.V.screen == 2, "release phase opens CHANGES (screen=" .. app.V.screen .. ")")
+  app.event(TOUCH_MOVE, cx, cy, EVT_TOUCH); app.event(TOUCH_LONG, cx, cy, EVT_TOUCH); tick()
+  check(app.V.screen == 2, "move/long phases landing on the new screen are consumed (screen=" .. app.V.screen .. ")")
+  app.event(KEY_RTN_FIRST, nil, nil, EVT_KEY); tick(); tick()
+  check(app.V.screen == 1, "RTN (an EVT_KEY event) still works (screen=" .. app.V.screen .. ")")
+end
 
 print("\n-- small layout")
 drawn = {}; app.paint(640, 360); app.V.screen = 2; app.paint(640, 360); app.V.screen = 4; app.paint(640, 360)

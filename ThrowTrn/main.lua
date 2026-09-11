@@ -131,17 +131,9 @@ local function widgetEvent(widget, category, value, x, y)
   -- above widgetCreate). An error here should not propagate and silently
   -- take wakeup()/real capture down with it.
   --
-  -- category is threaded through (previously dropped), though it turned
-  -- out not to be the fix: a tap was firing screen.lua's activate() twice
-  -- (confirmed on X20RS, 2026-09 -- MARK went armed then immediately
-  -- cancelled from one tap), and the theory was that category/value
-  -- distinguish press from release the way KEY_xxx_FIRST/KEY_xxx_BREAK do
-  -- for a physical key. A debug readout showed both calls came back with
-  -- the same category and near-identical, non-enum-looking values -- an
-  -- internal counter/timestamp, not a phase flag -- so screen.lua's fix
-  -- instead just pairs up alternating touch calls and swallows every
-  -- other one, regardless of value/category. category stays threaded
-  -- through since it's harmless and may still be useful later.
+  -- category is what lets screen.lua tell a touch (EVT_TOUCH, with
+  -- TOUCH_START/TOUCH_END phases in value) from a key (EVT_KEY); a tap
+  -- arrives as two calls and only the TOUCH_END one acts.
   local ok, handled = pcall(widget.app.event, value, x, y, category)
   if not ok then
     core.setStatus("event error: " .. tostring(handled))

@@ -4,7 +4,7 @@
 
 local core = {}
 
-core.VERSION = "2.0.0"
+core.VERSION = "2.0.1"
 
 -- ---------------------------------------------------------------- constants
 
@@ -391,11 +391,10 @@ end
 -- documented CATEGORY_* constant -- confirmed via the DLGPoker project's
 -- own hardware sweep (its spec S11): asking a manually-picked FS1 source
 -- what it is returned raw category number 12, member 0, with FS2-FS4 as
--- members 1-3 of that same numeric category. This literal is inherently
--- fragile -- not from any FrSky documentation, and could differ on
--- another Ethos build or radio family -- but it's the only approach
--- confirmed to actually work.
-local FS_CATEGORY_NUMERIC = 12
+-- members 1-3 of that same numeric category. Ethos 26.x names it
+-- CATEGORY_FUNCTION_SWITCH (confirmed equal to 12 by the Dial In probe);
+-- the literal stays as the fallback for firmware without the constant.
+local FS_CATEGORY_NUMERIC = rawget(_G, "CATEGORY_FUNCTION_SWITCH") or 12
 
 local function getFS(member)
   local ok, src = pcall(system.getSource,

@@ -41,6 +41,20 @@ local function isTouchCapable()
   return touchCapable
 end
 
+-- Ethos delivers a tap as two event() calls -- TOUCH_START then TOUCH_END,
+-- category EVT_TOUCH -- plus TOUCH_MOVE/TOUCH_LONG for drags and holds
+-- (confirmed with the Dial In probe on 26.1.2: 1 / 16640 / 16641 / 16642 /
+-- 16643). Fallback literals cover firmware that predates the named globals.
+local EVT_TOUCH_CAT = rawget(_G, "EVT_TOUCH") or 1
+local TOUCH_END_VAL = rawget(_G, "TOUCH_END") or 16641
+
+-- A caller that threads category through gets an exact answer; one that
+-- doesn't falls back to the old "touch radio with real coordinates" guess.
+local function isTouchEvent(category, x, y)
+  if category ~= nil then return category == EVT_TOUCH_CAT end
+  return isTouchCapable() and x ~= nil and y ~= nil and x > 0 and y > 0
+end
+
 -- Safe button first, so the default action is never destructive. Doesn't
 -- depend on any per-instance state, so it's exposed at module level and
 -- usable directly from main.lua's widgetConfigure (the widget's settings
@@ -119,9 +133,6 @@ function screen.new(opts)
     -- keyed by the SAME index activate() already uses for rotary+enter, so
     -- a tap and a rotary-select land on exactly the same action.
     keyRects = {},
-    -- True between a tap's press and its still-pending release call --
-    -- see self.event's touch-pairing comment.
-    touchConsuming = false,
   }
 
   local self = { V = V }
@@ -1424,22 +1435,11 @@ function screen.new(opts)
   -- ------------------------------------------------------------ events
 
   function self.event(value, x, y, category)
-    -- Touch phase pairing. Confirmed on X20RS (2026-09): Ethos calls this
-    -- TWICE per tap -- once on press, once on release -- and there's no
-    -- reliable value/category signal to tell them apart (both calls came
-    -- back with the same category and near-identical, non-enum-looking
-    -- values -- an internal counter/timestamp, not a phase flag). Rather
-    -- than guess at an undocumented meaning, treat every OTHER touch call
-    -- as the closing half of the same gesture and swallow it outright.
-    --
-    -- This has to run before the V.inForm/V.screen gates below, not inside
-    -- them -- a key like LOG or CONFIG changes V.screen/V.inForm as its
-    -- own action, so the release half of THAT tap would arrive with
-    -- different gate state than the press half and could otherwise slip
-    -- past unswallowed (or, worse, get treated as a fresh press on
-    -- whatever's now underneath it).
-    if V.touchConsuming and isTouchCapable() and x and y and x > 0 and y > 0 then
-      V.touchConsuming = false
+    -- Act on a tap's release only. Every other touch phase (start, move,
+    -- long-hold) is consumed here, ahead of the V.inForm/V.screen gates, so
+    -- a key whose action changes screens never sees the same tap's other
+    -- phases land on whatever is now underneath it.
+    if isTouchEvent(category, x, y) and value ~= TOUCH_END_VAL then
       return true
     end
 
@@ -1462,38 +1462,35 @@ function screen.new(opts)
 
     -- Touch: hit-test against the rectangles paintMain (or paintRevertConfirm)
     -- recorded this same frame.
-    if V.screen == MAIN and isTouchCapable() and x and y and x > 0 and y > 0 then
+    local touch = isTouchEvent(category, x, y)
+    if V.screen == MAIN and touch then
       for i, r in pairs(V.keyRects) do
         if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
           V.focus = i
           activate(i)
-          V.touchConsuming = true
           return true
         end
       end
     end
-    if V.screen == REVERT_CONFIRM and isTouchCapable() and x and y and x > 0 and y > 0 then
+    if V.screen == REVERT_CONFIRM and touch then
       for i, r in pairs(V.revertRects) do
         if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
           V.revertConfirmFocus = i
           activateRevertConfirm()
-          V.touchConsuming = true
           return true
         end
       end
     end
-    if V.screen == SETUP and isTouchCapable() and x and y and x > 0 and y > 0 then
+    if V.screen == SETUP and touch then
       for i, r in pairs(V.setupRects) do
         if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
           activateSetupKey(i)
-          V.touchConsuming = true
           return true
         end
       end
       local r = V.setupRudRect
       if r and x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
         activateSetupKey(4)                -- tapping the pill = RUD OFFSET key
-        V.touchConsuming = true
         return true
       end
     end

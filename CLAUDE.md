@@ -149,15 +149,17 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
     members 1-3 of that same numeric category (`core.lua`'s
     `FS_CATEGORY_NUMERIC`). This literal is inherently fragile — not from
     any FrSky documentation, could differ on another Ethos build — but
-    it's the only approach confirmed to work. **A tap on a touch-capable
-    radio (confirmed on X20RS, 2026-09) fires the widget's `event()`
-    callback TWICE per tap** (once on press, once on release), and there is
-    no reliable `value`/`category` signal distinguishing the two — both
-    calls came back identical on category and near-identical on value (an
-    internal counter/timestamp, not a phase flag). `screen.lua`'s
-    `self.event` fixes this by pairing alternating touch calls and
-    swallowing every other one (`V.touchConsuming`), rather than trying to
-    identify which phase is which.
+    it's the only approach confirmed to work — and Ethos 26.x names it
+    `CATEGORY_FUNCTION_SWITCH` (confirmed equal to 12), which `core.lua`
+    prefers with 12 as the fallback. **A tap on a touch-capable radio
+    fires the widget's `event()` callback TWICE per tap** (press, then
+    release), and the two ARE distinguishable: `category` is `EVT_TOUCH`
+    (1; keys are `EVT_KEY`, 0) and `value` is the phase — `TOUCH_START`
+    16640, `TOUCH_END` 16641, `TOUCH_MOVE` 16642, `TOUCH_LONG` 16643
+    (confirmed with the Dial In probe on 26.1.2). The earlier belief that
+    the values were an internal counter was wrong. `screen.lua`'s
+    `self.event` acts on `TOUCH_END` only and consumes every other touch
+    phase before any screen/form gate.
 
 ## Key design decisions worth preserving
 
@@ -274,8 +276,8 @@ check these"):**
 - Hardware FS1-FS4 driving MARK/UNDO/LOG/CFG, focus-gated so none of it
   fires unless the widget is the visible, focused thing on screen.
 - Touch support on a touch-capable radio (tested on the X20RS simulator;
-  the double-fire-per-tap pairing fix in fact #10 has not been confirmed
-  on a physical touchscreen).
+  the TOUCH_END-only phase gate in fact #10 has not been confirmed on a
+  physical touchscreen).
 - Auto-seeded demo data (with a marker) on a fresh install, and the
   existing purge-on-real-throw behavior correctly clearing it.
 
