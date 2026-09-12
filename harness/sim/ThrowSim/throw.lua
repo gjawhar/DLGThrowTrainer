@@ -21,6 +21,13 @@
 -- If the sensor ever shows "---" while this runs, re-check these there.
 local PHYS_ID = 0x1A
 local APP_ID  = 0x0100
+-- Receiver battery (S.Port RxBt, app ID 0xF104, value in 0.01 V) so the
+-- Main screen's top-right "RX x.xxV" readout has something to show in
+-- the simulator. UNVERIFIED that the sim model discovers it under this
+-- phys ID -- if "RX --" persists while this runs, check the radio's
+-- Telemetry page for what RxBatt is bound to (or discover new sensors).
+local RX_APP_ID = 0xF104
+local RX_CV     = 790      -- 7.90 V
 
 local PEAK   = 4500     -- centimetres (S.Port ALT is cm): 45 m
 local LEAD   = 5        -- s of ground-level frames before the climb
@@ -33,6 +40,8 @@ local STEP   = 0.2      -- s between frames
 local function send(cm)
   simulator.injectSPortFrame({ module = 0, band = 0, rx = 0,
     physId = PHYS_ID, primId = 0x10, appId = APP_ID, value = math.floor(cm) })
+  simulator.injectSPortFrame({ module = 0, band = 0, rx = 0,
+    physId = PHYS_ID, primId = 0x10, appId = RX_APP_ID, value = RX_CV })
 end
 
 local function stream(seconds, f)

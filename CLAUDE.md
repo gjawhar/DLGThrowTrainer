@@ -26,8 +26,8 @@ scripts/ThrowTrn/
                      review log, keys)
 ├── config.lua    -- the Settings form
 └── Files/        -- runtime data lives here (launches.csv, events.csv,
-                     gliders.csv, config.csv) -- ships with a .gitkeep,
-                     Lua can't create missing parent directories
+                     gliders.csv, config.csv, diag.csv) -- ships with a
+                     .gitkeep, Lua can't create missing parent directories
 ```
 
 Widget key is `thrwtrn` (max 7 chars, Ethos constraint). To test a change:
@@ -205,6 +205,36 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
   events.csv is 10 columns (deltas + revertToGrp); pre-2.0 4-column rows
   load unchanged. The rudder-offset baseline is read 2 s after boot
   because the VAR reads 0 for the first moments after power-on.
+- **Throw capture has two triggers** (core.lua `captureThrow`,
+  `realCapture`, `pollLaunchCycle`, `pollScheduledCapture`): the ALT_CALL
+  edge (a 100 ms pulse -- LSW24 `dur=0.1s` -- which polling CAN miss when
+  wakeup stalls, e.g. as the callout audio starts; proven in the field
+  2026-09-12: radio said "3 feet", no edge seen, widget alive) and the
+  flight mode leaving Launch/Zoom + CAPTURE_DELAY_SEC. One attempt per
+  launch cycle (`S.captured`, reset on entering Launch). Callout edges
+  within BOOT_CALL_IGNORE_SEC of boot are ignored (the template fires one
+  at power-on). Launch mode = launch button held, and that button also
+  resets the altitude sensor (SF11), so a bench press reads ~0 and is
+  refused as below floor -- same as the radio's own "zero" callout.
+- **Config persistence by NAME works where source objects don't**: the
+  RX voltage sensor is stored as `cfg.rxSensor` (a string, default
+  "RxBatt") and re-resolved via `system.getSource` at boot
+  (`core.resolveRxSource`). This is the pattern to use for the
+  still-open changeSwitch/undoSwitch persistence bug: persist
+  `src:name()` and look it up by name, don't tostring() the object.
+- **Main's top-right `RX 7.92V` readout** (`core.rxBatt()`, drawn on the
+  COMPARE header line in paintMain) reads the `RxBatt` sensor and the
+  template's `RXBAT_LOW` logic switch (red when > 0). Value is nil, shown
+  as `RX --`, when the sensor is missing OR older than the stale limit --
+  never show a frozen voltage. Both sources are optional and included in
+  the wakeup retry set and the diag boot row (`rx=ok/MISSING`).
+- **`Files/diag.csv` is the field trouble log** (core.lua's diagnostics
+  section, `core.diag(code, detail)`): boot/sources/throw/refused/
+  telem_lost/telem_back/rud_base/mark/init_error/io_error rows, capped at
+  DIAG_CAP with DIAG_SLACK hysteresis. Every refusal path in realCapture
+  writes one. Event-driven only -- never call it per wakeup. Details must
+  not contain commas. Not cleared by erase. Added after the 2026-09-11
+  field test left "throws weren't registering" with nothing to inspect.
 - **Run `python3 harness/run.py` before every deploy** — a lupa-driven
   suite (mocked Ethos globals, the real require chain) that executes the
   actual widget code. It found the duplicate-mark bug the simulator

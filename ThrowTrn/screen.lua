@@ -387,6 +387,18 @@ function screen.new(opts)
     local ry = colTop
     lcd.color(p.dim)
     draw.textAt(rightX, ry, "COMPARE", w - rightX - pad)
+    -- Receiver battery, top-right corner, on the COMPARE header line
+    -- (its right half is otherwise empty -- the values start on the rows
+    -- below). Small on purpose: it's a glance check between throws, not a
+    -- readout. Red = the template's own RXBAT_LOW says so; "--" = sensor
+    -- missing or stale, never a frozen old number (see core.rxBatt).
+    local rx = core.rxBatt()
+    local rxTxt = rx.value and string.format("RX %.2f%s", rx.value, rx.unit) or "RX --"
+    lcd.font(FONT_S)
+    lcd.color(rx.low and p.bad or (rx.value and p.text or p.dim))
+    local rxW = lcd.getTextSize(rxTxt)
+    draw.textAt(w - pad - rxW, ry, rxTxt)
+    lcd.color(p.dim)
     ry = ry + line + 2
 
     -- "Last N" keeps its number -- that's a configured window size, not a

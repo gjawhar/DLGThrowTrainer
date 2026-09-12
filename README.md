@@ -23,6 +23,11 @@ whether the difference is just throw-to-throw noise.
   Your next throw that clears the minimum height confirms the change as a
   mark, with the actual trim deltas recorded against it, so you never have
   to remember to press MARK after a field tweak.
+- **Receiver battery voltage**, small, in the top-right corner, so you
+  don't have to leave the widget to check it between throws. It turns red
+  when the template's own low-battery switch (`RXBAT_LOW`) trips, and shows
+  `RX --` rather than a stale number if the sensor is missing or the
+  telemetry link is down.
 - Day (light) or Night (dark) theme — defaults to Day, since most flying
   happens outdoors.
 - A fresh install starts with a small demo data set (including a sample
@@ -86,6 +91,28 @@ Auto-detected setup marks additionally use the **`V_RudOffset`** variable
 and the template's Throttle (camber/reflex) and Elevator trims. If any of
 these are renamed on your model, throws or changes silently stop
 registering — check the names before assuming the widget is broken.
+`Files/diag.csv` (see Diagnostics below) records which of them were found
+at every boot.
+
+The receiver-voltage readout uses the **`RxBatt`** sensor (changeable in
+Settings, "RX voltage source") and the **`RXBAT_LOW`** logic switch. Both
+are optional: without them the corner just reads `RX --`.
+
+### How throws are detected
+
+Two independent triggers, whichever comes first, one record per launch:
+
+- the template's **`ALT_CALL`** height-callout switch (a 100 ms pulse), and
+- the **flight mode** leaving Launch/Zoom, read 3 seconds later — the same
+  delay the template uses for the callout.
+
+The second exists because the first can be missed: if the radio is busy
+at the instant the pulse fires (it fires as the callout audio starts), the
+widget's polling never sees it. Flight mode is state, not a pulse, so a
+busy moment delays that path rather than losing the throw. `diag.csv`
+records which trigger caught each throw (`via=call` or `via=fm`). A
+callout in the first 10 seconds after power-on is ignored: the template
+fires one at boot with no telemetry behind it.
 
 ## Settings
 
@@ -94,7 +121,9 @@ Press **CFG**, or long-press the widget on a model screen (native Ethos
 entry — all three reach the same form) for: minimum height, comparison
 window size, stale-telemetry limit (how old the altitude reading may be
 before a throw is refused; 0 switches the check off, mainly for the
-simulator), bar count, and theme.
+simulator), RX voltage source (which sensor feeds the corner readout —
+default `RxBatt`; pick an analog input such as `AN1` if that's where your
+receiver reports it), bar count, and theme.
 
 **Known limitation:** switch-type config fields (CHANGE/UNDO switch
 assignment) do not currently survive a reboot — see `CLAUDE.md` for why
@@ -130,8 +159,19 @@ scripts/
 ```
 
 `Files/` must exist (even empty) because the widget stores
-`launches.csv`, `events.csv`, `gliders.csv`, and `config.csv` there
-automatically as it runs.
+`launches.csv`, `events.csv`, `gliders.csv`, `config.csv` and `diag.csv`
+there automatically as it runs.
+
+### Diagnostics
+
+`Files/diag.csv` is the widget's own trouble log: one line per boot (with
+the version and which template sources it found), per recorded throw (with
+the altitude sensor's age at the moment of the callout), per **refused**
+throw and why (stale telemetry, no altitude reading, below the minimum
+height), and whenever the altitude feed goes stale and comes back. It is
+capped at a few hundred lines. If throws aren't registering in the field,
+this file says why — copy it off the radio with the other CSVs when
+reporting a problem.
 
 ### Install manually via the SD card or internal storage
 

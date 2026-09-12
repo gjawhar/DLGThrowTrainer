@@ -15,6 +15,17 @@ local STATUS_SEC    = 3              -- status line dwell, wall-clock seconds
 
 core.STATUS_SEC = STATUS_SEC
 
+-- Throw capture timing (2026-09-12, see realCapture / pollLaunchCycle).
+-- CAPTURE_DELAY_SEC mirrors the template's own EXIT_ZOOM_DELAY (Edge(not
+-- ZOOM_MODE) + 3 s) so the widget and the radio's height callout read
+-- the same settled peak. BOOT_CALL_IGNORE_SEC: the template's ALT_CALL
+-- fires once ~3 s after power-on (that same edge, taken at boot), with
+-- no telemetry yet -- a real edge, not a stale-state artefact, so it
+-- can't be filtered by seeding the previous value; ignoring callout
+-- edges in a short window after boot is what removes it.
+local CAPTURE_DELAY_SEC     = 3
+local BOOT_CALL_IGNORE_SEC  = 10
+
 -- DLG template flight-mode numbering (CATEGORY_FLIGHT member 0's value),
 -- confirmed in reference_category_flight.md. Setup marks are only watched
 -- for and only confirmed while in one of these two.
@@ -56,6 +67,12 @@ local S = {
   -- All four only act once Throw Trainer's widget is the visible, focused
   -- thing on screen -- see main.lua's widgetWakeup and core.pollFS below.
   prevCall   = -100,
+  -- Launch-cycle tracking for the flight-mode capture path (2026-09-12):
+  prevFM     = nil,     -- last flight-mode reading, nil until the first
+  launchSeen = false,   -- Launch mode entered since the last capture cycle
+  captured   = false,   -- this cycle already produced a capture attempt
+  captureAt  = nil,     -- os.time() at which the fm path reads the peak
+  bootAt     = 0,
   prevChange = -100,
   prevUndo   = -100,
   prevFS1    = -100,
@@ -147,6 +164,13 @@ local function defaults()
                                  -- common case, so that's the default now
     changeSwitch = nil,
     undoSwitch   = nil,
+    -- Telemetry sensor NAME for the Main-screen RX voltage readout. A
+    -- string, not a source object, on purpose: source objects don't
+    -- survive config.csv (see CLAUDE.md's switch-persistence note --
+    -- tostring() of a source is inert on reload), a name re-resolves at
+    -- boot. Pilot's 2026-09-12 request: some setups feed RX voltage
+    -- through an analog input (e.g. "AN1") rather than the RxBatt sensor.
+    rxSensor     = "RxBatt",
   }
   return d
 end
@@ -265,12 +289,17 @@ local function readRows(base)
   return rows
 end
 
+-- Defined further down (diagnostics section); forward-declared so the two
+-- writers above it can report their own failures through it.
+local diag
+
 local function appendRow(base, fields)
   local p = path(base)
   if not p then return false end
   local f = io.open(p, "a")
   if not f then
     S.ioError = "append " .. base
+    if diag and base ~= "diag" then diag("io_error", "append " .. base) end
     return false
   end
   f:write(table.concat(fields, ",") .. "\n")
@@ -286,6 +315,7 @@ local function rewrite(base, keptRows)
   local f = io.open(p, "w")
   if not f then
     S.ioError = "rewrite " .. base
+    if diag and base ~= "diag" then diag("io_error", "rewrite " .. base) end
     return false
   end
   for i = 1, #keptRows do
@@ -297,6 +327,59 @@ end
 
 core.readRows = readRows
 core.rewrite  = rewrite
+
+-- ---------------------------------------------------------------- diagnostics
+
+-- Files/diag.csv: one row per thing worth knowing about after a session,
+-- `ts,gid,code,detail`. Exists because the 2026-09-11 field test (first
+-- ~7 throws not registered on a fresh Ethos 26.1.2, callouts still
+-- playing) left nothing to look at afterwards: every failure the widget
+-- can detect was a status line that lasts STATUS_SEC seconds, or
+-- nothing at all. Codes written so far:
+--   boot        version + which sources resolved (see sourcesSummary)
+--   sources     the resolved set changed after boot (a late sensor, etc.)
+--   throw       a recorded throw: height, sensor age at the callout edge
+--   refused     a throw NOT recorded and why: stale / noalt / low
+--   telem_lost  altitude feed stale for TELEM_WARN_SEC+ (then telem_back)
+--   rud_base    the deferred rudder-offset baseline read
+--   mark        a pending setup change confirmed into a mark
+--   init_error  core.init() raised (the text)
+--   io_error    a launches/events/config write failed
+-- Detail strings use spaces, never commas -- readRows splits on commas.
+-- Never per-wakeup: every writer above fires on an event, so a session
+-- adds tens of rows, not thousands. Capped by rewrite once DIAG_SLACK
+-- rows past DIAG_CAP so the file can't grow without bound on the card,
+-- and the cap costs one read+rewrite per ~DIAG_SLACK appends, not per
+-- append. Not per-glider and deliberately NOT cleared by core.erase --
+-- it's the widget's own history, not the pilot's data.
+local DIAG_CAP   = 300
+local DIAG_SLACK = 50
+
+diag = function(code, detail)
+  local p = path("diag")
+  if not p then return false end
+  if S.diagCount == nil then S.diagCount = #readRows("diag") end
+  local f = io.open(p, "a")
+  if not f then
+    S.ioError = "append diag"
+    return false
+  end
+  f:write(table.concat({ tostring(os.time()), S.gid or "", code,
+                         tostring(detail or "") }, ",") .. "\n")
+  f:close()
+  S.diagCount = S.diagCount + 1
+  if S.diagCount > DIAG_CAP + DIAG_SLACK then
+    local rows = readRows("diag")
+    local kept = {}
+    for i = math.max(1, #rows - DIAG_CAP + 1), #rows do kept[#kept + 1] = rows[i] end
+    rewrite("diag", kept)
+    S.diagCount = #kept
+  end
+  return true
+end
+core.diag = diag
+core.DIAG_CAP = DIAG_CAP
+core.DIAG_SLACK = DIAG_SLACK
 
 -- ---------------------------------------------------------------- identity
 
@@ -433,6 +516,40 @@ local function getVar(name)
   return nil
 end
 
+-- The RX voltage sensor comes from config by name (cfg.rxSensor,
+-- default "RxBatt"). Tried as a telemetry sensor first, then as a bare
+-- name lookup so a non-telemetry-category source picked in CFG still
+-- resolves. Called from resolveSources (before config is loaded, so the
+-- default applies), again from core.init once config IS loaded, and from
+-- core.setRxSensor. Retried on a slow cadence in wakeup while nil rather
+-- than every wakeup -- it's a cosmetic readout, and a model that simply
+-- has no such sensor shouldn't pay a per-wakeup lookup for it forever.
+function core.resolveRxSource()
+  local name = S.cfg and S.cfg.rxSensor
+  if type(name) ~= "string" or name == "" then name = "RxBatt" end
+  S.rxBattSrc = getSensor(name)
+  if not S.rxBattSrc then
+    local ok, src = pcall(system.getSource, { name = name })
+    if ok then S.rxBattSrc = src end
+  end
+  S.rxRetryAt = os.time() + 5
+end
+
+function core.rxSensorName()
+  local name = S.cfg and S.cfg.rxSensor
+  if type(name) ~= "string" or name == "" then name = "RxBatt" end
+  return name
+end
+
+-- CFG setter: nil/"" restores the default. Persists the name and
+-- re-resolves immediately so the corner readout follows the picker.
+function core.setRxSensor(name)
+  if type(name) ~= "string" or name == "" then name = nil end
+  S.cfg.rxSensor = name or "RxBatt"
+  core.saveConfig()
+  core.resolveRxSource()
+end
+
 local function resolveSources()
   S.altSrc    = getSensor("Altitude")
   S.callSrc   = getLogic("ALT_CALL")
@@ -445,6 +562,15 @@ local function resolveSources()
   S.elevSrc   = getTrimMember(1)
   S.rudSrc    = getVar("V_RudOffset")
   S.fmSrc     = getFlightModeSrc()
+  -- Receiver battery, shown small on Main (pilot's request 2026-09-12:
+  -- they were flipping to the telemetry screen between throws just to
+  -- check it). "RxBatt" is the sensor the DLG template's own RXBAT_LOW
+  -- switch reads (SettingsRef, LSW27: "RxBatt < 7.00V"); the switch is
+  -- what turns the readout red, so the widget agrees with the radio's
+  -- own low-battery call rather than inventing a threshold. Both are
+  -- optional -- a model without them just shows "RX --".
+  core.resolveRxSource()
+  S.rxLowSrc  = getLogic("RXBAT_LOW")
   if S.altSrc then
     local ok, u = pcall(function() return S.altSrc:stringUnit() end)
     if ok and type(u) == "string" and u ~= "" then S.unit = u end
@@ -453,6 +579,18 @@ local function resolveSources()
 end
 
 core.resolveSources = resolveSources
+
+-- One-line picture of what resolveSources found, for diag rows. "ok" or
+-- "MISSING" per source so a grep for MISSING finds every bad boot. The
+-- same string is what the wakeup retry compares to notice a late arrival.
+local function sourcesSummary()
+  local function ok(v) return v and "ok" or "MISSING" end
+  local nfs = (S.fs1 and 1 or 0) + (S.fs2 and 1 or 0) + (S.fs3 and 1 or 0) + (S.fs4 and 1 or 0)
+  return string.format("alt=%s call=%s launch=%s fm=%s rud=%s camber=%s elev=%s fs=%d rx=%s:%s unit=%s",
+    ok(S.altSrc), ok(S.callSrc), ok(S.launchSrc), ok(S.fmSrc), ok(S.rudSrc),
+    ok(S.camberSrc), ok(S.elevSrc), nfs, core.rxSensorName(), ok(S.rxBattSrc), S.unit or "")
+end
+core.sourcesSummary = sourcesSummary
 
 -- ---------------------------------------------------------------- config io
 
@@ -1223,6 +1361,29 @@ end
 -- (pilot, 2026-09-10, simulator) made that line flicker between the set
 -- captions and the warning every frame. Same os.time-based dwell idea as
 -- core.status.
+-- Receiver battery for the Main-screen corner readout. value is nil when
+-- the sensor is missing OR its reading is older than the stale limit
+-- (same rule as the altitude gate; limit 0 = never stale) -- a frozen
+-- last value would be exactly the wrong thing to reassure a pilot with.
+-- low mirrors the template's RXBAT_LOW logic switch (> 0 = active).
+function core.rxBatt()
+  local out = { value = nil, unit = "V", low = false, present = S.rxBattSrc ~= nil }
+  if not S.rxBattSrc then return out end
+  local limit = S.cfg.stale
+  if limit == nil then limit = 2 end
+  local age = srcAge(S.rxBattSrc)
+  local fresh = (limit <= 0) or (age >= 0 and age < limit * 1000)
+  local v = srcValue(S.rxBattSrc)
+  if fresh and type(v) == "number" then out.value = v end
+  local ok, u = pcall(function() return S.rxBattSrc:stringUnit() end)
+  if ok and type(u) == "string" and u ~= "" then out.unit = u end
+  if S.rxLowSrc then
+    local l = srcValue(S.rxLowSrc)
+    out.low = type(l) == "number" and l > 0
+  end
+  return out
+end
+
 local TELEM_WARN_SEC = 3
 function core.telemetryWarning()
   if core.telemetryLive() then
@@ -1398,6 +1559,9 @@ function core.confirmPendingSetup()
     zoomCamber   = pZoom and pZoom.camber,
     zoomElev     = pZoom and pZoom.elev,
   })
+  diag("mark", string.format("Lcam=%s Lele=%s rud=%s Zcam=%s Zele=%s",
+    tostring(pLaunch and pLaunch.camber), tostring(pLaunch and pLaunch.elev),
+    tostring(S.pendingRud), tostring(pZoom and pZoom.camber), tostring(pZoom and pZoom.elev)))
 
   -- Re-baseline each confirmed axis to the value it was detected AT
   -- (baseline + delta), NOT a live trim read gated on being in that mode:
@@ -1698,27 +1862,105 @@ function core.finishRevert()
   haptic(60)
 end
 
--- Launch height is the sensor's running peak read on the ALT_CALL rising
--- edge. The template resets that peak on the launch edge, so the value
--- belongs to the throw that just finished.
+-- Launch height is the sensor's running peak (the template resets it on
+-- the launch button via SF11 "Reset Telemetry: Altitude", so the value
+-- belongs to the throw that just finished). Two independent triggers
+-- read it, whichever comes first, one attempt per launch cycle:
+--
+--  "call" -- the ALT_CALL logic switch's rising edge. This was the ONLY
+--            trigger through 2.0.1 and it is a 100 ms pulse (LSW24,
+--            "dur=0.1s"): if Ethos doesn't run wakeup() inside that
+--            window the throw is simply never seen -- no refusal, no
+--            row, nothing. It fires at the exact moment the radio starts
+--            synthesising the height callout, which is when a wakeup
+--            stall is likeliest. 2026-09-12 field test: radio announced
+--            "3 feet", diag.csv shows no edge at all, widget provably
+--            alive (it logged the link loss 20 s later). Same signature
+--            as the 2026-09-11 session on fresh 26.1.2 firmware.
+--  "fm"   -- flight mode is STATE, not a pulse, and it's already polled
+--            every wakeup. Launch mode = launch button held; Zoom follows
+--            it (sticky until the elevator push). When the mode leaves
+--            Launch/Zoom after a Launch visit, pollLaunchCycle schedules
+--            a read CAPTURE_DELAY_SEC later, the template's own callout
+--            delay. A wakeup gap can delay this path, never lose it.
+--
+-- Both go through captureThrow so the stale/floor gates and the diag
+-- rows are identical; the row says which trigger won (via=call|fm).
+local function captureThrow(via)
+  S.captured = true
+  local age  = srcAge(S.altSrc)
+  local peak = srcValue(S.altSrc, { options = OPTION_SENSOR_MAX })
+  local peakTxt = type(peak) == "number" and string.format("%.1f", peak) or "nil"
+
+  if not core.telemetryLive() then
+    core.setStatus("stale telemetry - not recorded")
+    diag("refused", string.format("stale age=%dms limit=%ss peak=%s via=%s",
+      age, tostring(S.cfg.stale), peakTxt, via))
+    return
+  end
+
+  if type(peak) ~= "number" then
+    core.setStatus("no altitude reading")
+    diag("refused", string.format("noalt age=%dms via=%s", age, via))
+    return
+  end
+  local st = core.recordLaunch(peak, S.unit, os.time())
+  if st == "low" then
+    diag("refused", string.format("low h=%s floor=%s age=%dms via=%s",
+      peakTxt, tostring(S.cfg.floor), age, via))
+  else
+    diag("throw", string.format("h=%s %s grp=%d age=%dms via=%s",
+      peakTxt, S.unit, core.currentGroup(), age, via))
+  end
+end
+
 local function realCapture()
   local call = srcValue(S.callSrc)
   if type(call) ~= "number" then return end
   local rising = (S.prevCall <= 0 and call > 0)
   S.prevCall = call
   if not rising then return end
-
-  if not core.telemetryLive() then
-    core.setStatus("stale telemetry - not recorded")
+  if os.time() - S.bootAt < BOOT_CALL_IGNORE_SEC then
+    diag("ignored", string.format("call %ds after boot", os.time() - S.bootAt))
     return
   end
+  if S.captured then return end        -- fm path already took this cycle
+  captureThrow("call")
+end
 
-  local peak = srcValue(S.altSrc, { options = OPTION_SENSOR_MAX })
-  if type(peak) ~= "number" then
-    core.setStatus("no altitude reading")
-    return
+-- Flight-mode side of capture, see captureThrow. Entering Launch starts a
+-- fresh cycle (clears `captured`, so a second real throw is never masked
+-- by the first). Leaving Launch/Zoom after a Launch visit arms the timer;
+-- bouncing back into Launch/Zoom before it fires disarms it, and the
+-- next exit re-arms -- so a mode flicker can't double-capture and can't
+-- capture early. A Launch visit with no throw (bench press of the launch
+-- button) still runs the cycle: SF11 has reset the altitude, so the peak
+-- reads ~0 and it's refused as below floor -- the same "zero" the radio
+-- itself calls out in that situation.
+local function pollLaunchCycle()
+  local fm = core.currentFlightMode()
+  if fm == nil then return end
+  local prev = S.prevFM
+  S.prevFM = fm
+  if prev == nil then return end          -- first reading: just establish state
+  local inLZ  = (fm == FM_LAUNCH or fm == FM_ZOOM)
+  local wasLZ = (prev == FM_LAUNCH or prev == FM_ZOOM)
+  if fm == FM_LAUNCH and prev ~= FM_LAUNCH then
+    S.launchSeen = true
+    S.captured   = false
+    S.captureAt  = nil
+  elseif S.launchSeen and wasLZ and not inLZ then
+    S.captureAt = os.time() + CAPTURE_DELAY_SEC
+  elseif inLZ and S.captureAt then
+    S.captureAt = nil
   end
-  core.recordLaunch(peak, S.unit, os.time())
+end
+
+local function pollScheduledCapture()
+  if not S.captureAt or os.time() < S.captureAt then return end
+  S.captureAt  = nil
+  S.launchSeen = false
+  if not S.captured then captureThrow("fm") end
 end
 
 -- Rising-edge detection shared by both assignable switches: level is ignored,
@@ -1821,11 +2063,13 @@ end
 
 function core.init()
   if S.ready then return end
+  S.bootAt = os.time()
   S.dir = resolveDir()
   if not S.dir then S.ioError = "no writable Files/ folder" end
   resolveSources()
   local fresh = bindIdentity()
   loadIdentityData(fresh)
+  core.resolveRxSource()          -- config (cfg.rxSensor) is loaded now
   -- A power cycle closes the open group without arming CHANGE.
   if #S.launches > 0 and not core.isArmed() then
     addEvent("power")
@@ -1836,6 +2080,12 @@ function core.init()
   -- reboot untouched).
   core.captureSetupBaseline()
   S.ready = true
+  diag("boot", "v" .. core.VERSION .. " " .. sourcesSummary()
+    .. string.format(" stale=%s floor=%s", tostring(S.cfg.stale), tostring(S.cfg.floor)))
+  S.lastSources = sourcesSummary()
+  -- One follow-up row if anything is still missing well after boot, so a
+  -- source that never arrives shows up without flooding a row per wakeup.
+  S.sourcesCheckAt = os.time() + 15
 end
 
 function core.wakeup()
@@ -1845,12 +2095,18 @@ function core.wakeup()
     -- transient boot-time failure gets another chance every wakeup instead
     -- of silently disabling the whole widget for the rest of the session.
     local ok, err = pcall(core.init)
-    if not ok then core.setStatus("init error: " .. tostring(err)) end
+    if not ok then
+      core.setStatus("init error: " .. tostring(err))
+      -- S.dir may already be resolved (it's the first thing init does),
+      -- in which case this is recordable; if not, diag just returns false.
+      pcall(diag, "init_error", tostring(err):gsub(",", ";"))
+    end
     return
   end
   if not identityStillCurrent() then
     local fresh = bindIdentity()
     loadIdentityData(fresh)
+    core.resolveRxSource()
     core.captureSetupBaseline()
   end
 
@@ -1884,10 +2140,43 @@ function core.wakeup()
   -- visited, not eagerly the way rud's is. altSrc/callSrc/launchSrc need
   -- no backfill of any kind -- realCapture just starts working the very
   -- next tick once they're no longer nil.
+  if not S.rxBattSrc and os.time() >= (S.rxRetryAt or 0) then
+    core.resolveRxSource()
+  end
   if not (S.camberSrc and S.elevSrc and S.rudSrc and S.fmSrc
           and S.altSrc and S.callSrc and S.launchSrc
           and S.fs1 and S.fs2 and S.fs3 and S.fs4) then
     resolveSources()
+    local now = sourcesSummary()
+    if now ~= S.lastSources then
+      diag("sources", now)
+      S.lastSources = now
+    end
+  end
+  if S.sourcesCheckAt and os.time() >= S.sourcesCheckAt then
+    S.sourcesCheckAt = nil
+    local now = sourcesSummary()
+    if now:find("MISSING", 1, true) then diag("sources", "still " .. now) end
+  end
+
+  -- Altitude feed health, edge-logged: one row when it has been stale for
+  -- TELEM_WARN_SEC (same dwell as the on-screen warning), one when it
+  -- comes back with how long it was gone. With the stale gate off
+  -- (cfg.stale = 0) telemetryLive is always true and nothing is logged.
+  if S.altSrc then
+    if core.telemetryLive() then
+      if S.telemLostLogged then
+        diag("telem_back", string.format("after=%ds", os.time() - S.telemStaleAt))
+        S.telemLostLogged = false
+      end
+      S.telemStaleAt = nil
+    else
+      S.telemStaleAt = S.telemStaleAt or os.time()
+      if not S.telemLostLogged and os.time() - S.telemStaleAt >= TELEM_WARN_SEC then
+        diag("telem_lost", string.format("age=%dms", srcAge(S.altSrc)))
+        S.telemLostLogged = true
+      end
+    end
   end
 
   -- Deferred rudder-offset baseline (see RUD_SETTLE_SEC): read once the
@@ -1896,9 +2185,12 @@ function core.wakeup()
   -- just gets read whenever it first exists after the window.
   if S.baseRud == nil and S.rudSrc and os.time() >= (S.rudBaselineAt or 0) then
     S.baseRud = srcValue(S.rudSrc)
+    diag("rud_base", "v=" .. tostring(S.baseRud))
   end
 
+  pollLaunchCycle()
   realCapture()
+  pollScheduledCapture()
   pollSwitches()
   core.pollSetupChange()
 end

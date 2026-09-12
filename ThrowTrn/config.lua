@@ -55,6 +55,25 @@ function config.build(onErase, onDone)
   line = panel:addLine("Stale telemetry limit (0=off)")
   num(line, 0, 30, "stale", "s")
 
+  -- Which sensor feeds the Main screen's top-right "RX x.xxV" readout.
+  -- Default is the template's RxBatt; some receivers report it through
+  -- an analog input instead. Persisted by NAME (core.setRxSensor), not
+  -- as a source object -- see CLAUDE.md on why source objects don't
+  -- survive a reboot through config.csv. The picker shows the currently
+  -- resolved source; clearing it restores the default.
+  line = panel:addLine("RX voltage source")
+  form.addSourceField(line, nil,
+    function() return core.S.rxBattSrc end,
+    function(v)
+      if v == nil then core.setRxSensor(nil) return end
+      local ok, n = pcall(function() return v:name() end)
+      if ok and type(n) == "string" and n ~= "" then
+        core.setRxSensor(n)
+      else
+        core.setStatus("could not read that source's name")
+      end
+    end)
+
   -- Controls ----------------------------------------------------------------
   panel = form.addExpansionPanel("Controls")
 
