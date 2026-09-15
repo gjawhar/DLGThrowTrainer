@@ -35,6 +35,10 @@ local BOOT_CALL_IGNORE_SEC  = 10
 -- single throw.
 local RESET_WAIT_SEC   = 2
 local RESET_GRACE_SEC  = 10
+-- diag "boot" row: written from wakeup this long after init, retried
+-- once a second until it lands (see pollBootRow / diag's comment).
+local BOOT_ROW_DELAY_SEC = 1
+local BOOT_ROW_MAX_TRIES = 30
 
 -- DLG template flight-mode numbering (CATEGORY_FLIGHT member 0's value),
 -- confirmed in reference_category_flight.md. Setup marks are only watched
@@ -306,6 +310,17 @@ end
 -- writers above it can report their own failures through it.
 local diag
 
+-- A write error is a status-line message ("storage: append diag"), and it
+-- used to be sticky: one failed append -- which the radio does produce,
+-- right after boot -- kept that message on the bottom line for the whole
+-- session, hiding the telemetry warning and the set captions. Any later
+-- successful write clears it. The "no writable Files/ folder" case is
+-- different (nothing can succeed after it) and is left alone.
+local NO_DIR_ERROR = "no writable Files/ folder"
+local function clearWriteError()
+  if S.ioError and S.ioError ~= NO_DIR_ERROR then S.ioError = nil end
+end
+
 local function appendRow(base, fields)
   local p = path(base)
   if not p then return false end
@@ -317,6 +332,7 @@ local function appendRow(base, fields)
   end
   f:write(table.concat(fields, ",") .. "\n")
   f:close()
+  clearWriteError()
   return true
 end
 
@@ -335,6 +351,7 @@ local function rewrite(base, keptRows)
     f:write(table.concat(keptRows[i], ",") .. "\n")
   end
   f:close()
+  clearWriteError()
   return true
 end
 
@@ -368,18 +385,32 @@ core.rewrite  = rewrite
 local DIAG_CAP   = 300
 local DIAG_SLACK = 50
 
+-- The row count is taken ONCE, in core.init right after the Files/ dir
+-- resolves (see there), not lazily here: the boot row went missing on 3
+-- of the first ~10 real boots (2026-09-12/15 field logs) while the
+-- events.csv write a moment earlier always landed -- the one thing
+-- unique to that first diag write was a read of the same file
+-- immediately followed by opening it for append, in one call. A failed
+-- append is counted (S.diagLost) and reported as " lost=N" on the next
+-- row that does land, so a dropped write is never invisible.
 diag = function(code, detail)
   local p = path("diag")
   if not p then return false end
-  if S.diagCount == nil then S.diagCount = #readRows("diag") end
+  if S.diagCount == nil then S.diagCount = 0 end
   local f = io.open(p, "a")
   if not f then
     S.ioError = "append diag"
+    S.diagLost = (S.diagLost or 0) + 1
     return false
   end
-  f:write(table.concat({ tostring(os.time()), S.gid or "", code,
-                         tostring(detail or "") }, ",") .. "\n")
+  detail = tostring(detail or "")
+  if (S.diagLost or 0) > 0 then
+    detail = detail .. " lost=" .. S.diagLost
+    S.diagLost = 0
+  end
+  f:write(table.concat({ tostring(os.time()), S.gid or "", code, detail }, ",") .. "\n")
   f:close()
+  clearWriteError()
   S.diagCount = S.diagCount + 1
   if S.diagCount > DIAG_CAP + DIAG_SLACK then
     local rows = readRows("diag")
@@ -1073,7 +1104,11 @@ function core.recordLaunch(height, unit, ts)
   ts = ts or os.time()
   unit = unit or S.unit
 
-  if height < (S.cfg.floor or 25) then
+  -- A peak of zero (or less) is never a throw, whatever the floor: with
+  -- the floor at 0 for yard testing, bench presses of the launch button
+  -- (which resets the sensor to 0) were being logged as 0 ft throws
+  -- (2026-09-12 field log).
+  if height <= 0 or height < (S.cfg.floor or 25) then
     -- Discarded, armed state intact -- but not silently any more (2026-09-09):
     -- a throw genuinely clearing the floor was hard to tell apart from
     -- one that didn't while debugging a separate capture issue, since
@@ -2117,7 +2152,8 @@ function core.init()
   if S.ready then return end
   S.bootAt = os.time()
   S.dir = resolveDir()
-  if not S.dir then S.ioError = "no writable Files/ folder" end
+  if not S.dir then S.ioError = NO_DIR_ERROR end
+  if S.dir and S.diagCount == nil then S.diagCount = #readRows("diag") end
   resolveSources()
   local fresh = bindIdentity()
   loadIdentityData(fresh)
@@ -2132,12 +2168,27 @@ function core.init()
   -- reboot untouched).
   core.captureSetupBaseline()
   S.ready = true
-  diag("boot", "v" .. core.VERSION .. " " .. sourcesSummary()
-    .. string.format(" stale=%s floor=%s", tostring(S.cfg.stale), tostring(S.cfg.floor)))
+  -- The boot row is written from wakeup, BOOT_ROW_DELAY_SEC after init,
+  -- and retried until it lands (see pollBootRow) -- not here, where 3 of
+  -- the first ~10 real boots lost it (see diag's comment).
+  S.bootRowAt   = os.time() + BOOT_ROW_DELAY_SEC
+  S.bootRowTries = 0
   S.lastSources = sourcesSummary()
   -- One follow-up row if anything is still missing well after boot, so a
   -- source that never arrives shows up without flooding a row per wakeup.
   S.sourcesCheckAt = os.time() + 15
+end
+
+local function pollBootRow()
+  if not S.bootRowAt or os.time() < S.bootRowAt then return end
+  local ok = diag("boot", "v" .. core.VERSION .. " " .. sourcesSummary()
+    .. string.format(" stale=%s floor=%s", tostring(S.cfg.stale), tostring(S.cfg.floor)))
+  S.bootRowTries = (S.bootRowTries or 0) + 1
+  if ok or S.bootRowTries >= BOOT_ROW_MAX_TRIES then
+    S.bootRowAt = nil
+  else
+    S.bootRowAt = os.time() + 1     -- try again next second
+  end
 end
 
 function core.wakeup()
@@ -2223,6 +2274,7 @@ function core.wakeup()
       S.lastSources = now
     end
   end
+  pollBootRow()
   if S.sourcesCheckAt and os.time() >= S.sourcesCheckAt then
     S.sourcesCheckAt = nil
     local now = sourcesSummary()

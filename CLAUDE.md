@@ -242,6 +242,18 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
   as `RX --`, when the sensor is missing OR older than the stale limit --
   never show a frozen voltage. Both sources are optional and included in
   the wakeup retry set and the diag boot row (`rx=ok/MISSING`).
+- **Boot-time writes can be dropped on the X14** (3 of the first ~10 real
+  boots lost the diag `boot` row while the events.csv write a moment
+  earlier landed). The boot row is therefore written from wakeup
+  (`pollBootRow`, BOOT_ROW_DELAY_SEC after init, retried each second up to
+  BOOT_ROW_MAX_TRIES), diag.csv's row count is taken once in init rather
+  than by a read immediately before the first append, a failed append is
+  counted and reported as ` lost=N` on the next row that lands, and a
+  successful write clears a previous write error (`clearWriteError`) so
+  "storage: append ..." can't stay on the status line all session.
+- **A peak of 0 is never a throw** (`recordLaunch`, `height <= 0`) whatever
+  the floor -- with floor 0 for yard testing, bench presses of the launch
+  button (sensor reset to 0) were logged as 0 ft throws.
 - **`Files/diag.csv` is the field trouble log** (core.lua's diagnostics
   section, `core.diag(code, detail)`): boot/sources/throw/refused/
   telem_lost/telem_back/rud_base/mark/init_error/io_error rows, capped at

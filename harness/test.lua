@@ -155,7 +155,6 @@ check(sawText("RX --") and not sawText("RX 7.90V"), "stale RxBatt shows RX -- no
 SIM.rxAge = 100; SIM.rxLow = 100; tick()
 check(sawText("RX 7.90V") and core.rxBatt().low, "RXBAT_LOW active -> low flag (red)")
 SIM.rxLow = -100; tick()
-check(diagHas("boot", "rx=RxBatt:ok"), "diag: boot row reports rx sensor by name")
 core.setRxSensor("AN1"); tick()
 check(sawText("RX 4.10V"), "CFG: RX source switched to AN1 by name")
 local savedRx = false
@@ -168,9 +167,23 @@ check(sawText("RX 7.90V"), "CFG: clearing the RX source falls back to RxBatt")
 check(#core.S.launches == 10, "fresh glider seeded with 10 throws (" .. #core.S.launches .. ")")
 check(core.S.baselineGrp == 0, "baselineGrp starts 0")
 check(core.S.baseRud == nil, "rud baseline NOT read during the settle window")
-check(diagHas("boot", "v" .. core.VERSION) and diagHas("boot", "alt=ok call=ok"), "diag: boot row with version + sources")
-check(not diagHas("boot", "MISSING"), "diag: boot row shows nothing missing")
+check(not diagHas("boot"), "diag: boot row is NOT written inside init")
+-- Make the very first append of the boot row fail, the way the radio did
+-- on 3 of its first ~10 boots, and check it is retried and the loss counted.
+local realOpen, failOnce = io.open, true
+io.open = function(p, mode)
+  if failOnce and mode == "a" and tostring(p):find("diag", 1, true) then failOnce = false; return nil end
+  return realOpen(p, mode)
+end
 tOff = tOff + 3; tick()
+check(not diagHas("boot"), "diag: first boot-row write failed (injected)")
+tOff = tOff + 1; tick()
+io.open = realOpen
+check(diagHas("boot", "v" .. core.VERSION) and diagHas("boot", "alt=ok call=ok"), "diag: boot row retried and landed")
+check(diagHas("boot", "lost=1") or diagHas("rud_base", "lost=1"), "diag: the lost write is reported on the next row that landed")
+check(not diagHas("boot", "MISSING"), "diag: boot row shows nothing missing")
+check(diagHas("boot", "rx=RxBatt:ok"), "diag: boot row reports rx sensor by name")
+check(core.S.ioError == nil, "storage error cleared by the next successful write")
 check(core.S.baseRud == 5, "rud baseline read after settling (" .. tostring(core.S.baseRud) .. ")")
 check(diagHas("rud_base", "v=5"), "diag: rud_base row")
 SIM.fm = 2; tick(); SIM.fm = 0
@@ -209,6 +222,12 @@ core.S.cfg.floor = 100
 throw(50)
 check(#core.S.launches == 3, "below-floor throw not recorded")
 check(lastDiag()[3] == "refused" and (lastDiag()[4] or ""):find("low h=50.0 floor=100", 1, true), "diag: refused low row (" .. tostring(lastDiag()[4]) .. ")")
+core.S.cfg.floor = 0
+throw(0)
+check(#core.S.launches == 3 and (lastDiag()[4] or ""):find("low h=0.0", 1, true), "peak 0 with floor 0 is still refused (bench press)")
+throw(1)
+check(#core.S.launches == 4, "peak 1 with floor 0 is recorded")
+core.undo()
 core.S.cfg.floor = floorWas
 SIM.altAge = 5000; tick()
 check(not diagHas("telem_lost"), "diag: no telem_lost before the dwell")

@@ -177,8 +177,10 @@ there automatically as it runs.
 the version and which template sources it found), per recorded throw (with
 the altitude sensor's age at the moment of the callout), per **refused**
 throw and why (stale telemetry, no altitude reading, below the minimum
-height), and whenever the altitude feed goes stale and comes back. It is
-capped at a few hundred lines. If throws aren't registering in the field,
+height), whenever the altitude feed goes stale and comes back, and every
+time you switch models on the radio. It is capped at a few hundred lines.
+A dropped write shows up as `lost=N` on the next line, so a gap is never
+silent. If throws aren't registering in the field,
 this file says why — copy it off the radio with the other CSVs when
 reporting a problem.
 
