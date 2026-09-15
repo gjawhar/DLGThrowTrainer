@@ -219,7 +219,7 @@ function screen.new(opts)
       draw.textAt(pad, sy, "storage: " .. core.S.ioError, w - pad * 2)
     elseif core.telemetryWarning() then
       lcd.color(p.bad)
-      draw.textAt(pad, sy, "no telemetry", w - pad * 2)
+      draw.textAt(pad, sy, core.telemetryState() == "none" and "no telemetry link" or "stale telemetry", w - pad * 2)
     end
   end
 

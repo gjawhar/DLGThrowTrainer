@@ -111,8 +111,17 @@ at the instant the pulse fires (it fires as the callout audio starts), the
 widget's polling never sees it. Flight mode is state, not a pulse, so a
 busy moment delays that path rather than losing the throw. `diag.csv`
 records which trigger caught each throw (`via=call` or `via=fm`). A
-callout in the first 10 seconds after power-on is ignored: the template
-fires one at boot with no telemetry behind it.
+callout in the first 10 seconds after power-on, or after switching models
+on the radio, is ignored: the template fires one in both cases with
+nothing behind it. The launch button also resets the altitude sensor, and
+for a few seconds afterwards the radio reports it as "never received";
+the widget waits up to 2 seconds for the first packet before deciding a
+throw is unrecordable.
+
+The bottom line of the main screen distinguishes **no telemetry link**
+(the radio has never heard from the plane's sensor since power-on: check
+the plane and receiver) from **stale telemetry** (it had data and it
+stopped).
 
 ## Settings
 

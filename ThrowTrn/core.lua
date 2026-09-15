@@ -25,6 +25,16 @@ core.STATUS_SEC = STATUS_SEC
 -- edges in a short window after boot is what removes it.
 local CAPTURE_DELAY_SEC     = 3
 local BOOT_CALL_IGNORE_SEC  = 10
+-- The template's SF11 resets the Altitude sensor on the launch button,
+-- and for the next 3-5 s (field logs, 2026-09-13/15) its age() reads -1
+-- ("never received") even though packets are arriving. A capture that
+-- lands inside that window would be refused as stale for no reason, so
+-- captureThrow waits once, RESET_WAIT_SEC, if age is still -1 within
+-- RESET_GRACE_SEC of the launch. The same grace keeps the on-screen "no
+-- telemetry" warning and the telem_lost diag row from firing on every
+-- single throw.
+local RESET_WAIT_SEC   = 2
+local RESET_GRACE_SEC  = 10
 
 -- DLG template flight-mode numbering (CATEGORY_FLIGHT member 0's value),
 -- confirmed in reference_category_flight.md. Setup marks are only watched
@@ -72,6 +82,9 @@ local S = {
   launchSeen = false,   -- Launch mode entered since the last capture cycle
   captured   = false,   -- this cycle already produced a capture attempt
   captureAt  = nil,     -- os.time() at which the fm path reads the peak
+  captureVia = nil,     -- trigger name carried across a RESET_WAIT deferral
+  captureWaited = false,-- the one RESET_WAIT_SEC deferral has been used
+  lastLaunchAt = nil,   -- os.time() Launch mode was last entered
   bootAt     = 0,
   prevChange = -100,
   prevUndo   = -100,
@@ -1385,13 +1398,31 @@ function core.rxBatt()
 end
 
 local TELEM_WARN_SEC = 3
+-- True while the altitude sensor's age reads -1 inside the post-launch
+-- reset grace: the feed isn't gone, the template just reset the sensor.
+local function inResetGrace()
+  return S.lastLaunchAt ~= nil
+     and os.time() - S.lastLaunchAt <= RESET_GRACE_SEC
+     and srcAge(S.altSrc) < 0
+end
+
 function core.telemetryWarning()
-  if core.telemetryLive() then
+  if core.telemetryLive() or inResetGrace() then
     S.staleSince = nil
     return false
   end
   S.staleSince = S.staleSince or os.time()
   return os.time() - S.staleSince >= TELEM_WARN_SEC
+end
+
+-- What the warning line should say: "none" = the sensor has never
+-- received anything (no link to the plane -- go check the receiver),
+-- "stale" = it had data and stopped. Pilot's field report 2026-09-15:
+-- "stale telemetry" read like a hiccup when the radio had never linked.
+function core.telemetryState()
+  if core.telemetryLive() then return "ok" end
+  if srcAge(S.altSrc) < 0 then return "none" end
+  return "stale"
 end
 
 -- ---------------------------------------------------------------- setup marks (2.0)
@@ -1887,15 +1918,31 @@ end
 -- Both go through captureThrow so the stale/floor gates and the diag
 -- rows are identical; the row says which trigger won (via=call|fm).
 local function captureThrow(via)
+  local age = srcAge(S.altSrc)
+  -- Sensor just reset by the launch button (see RESET_WAIT_SEC): give the
+  -- first packet a moment instead of refusing outright. Once per cycle.
+  if age < 0 and not S.captureWaited and S.lastLaunchAt
+     and os.time() - S.lastLaunchAt <= RESET_GRACE_SEC then
+    S.captureWaited = true
+    S.captureVia    = via
+    S.captureAt     = os.time() + RESET_WAIT_SEC
+    diag("wait", string.format("age=-1 %ds after launch, waiting %ds via=%s",
+      os.time() - S.lastLaunchAt, RESET_WAIT_SEC, via))
+    return
+  end
   S.captured = true
-  local age  = srcAge(S.altSrc)
   local peak = srcValue(S.altSrc, { options = OPTION_SENSOR_MAX })
   local peakTxt = type(peak) == "number" and string.format("%.1f", peak) or "nil"
 
   if not core.telemetryLive() then
-    core.setStatus("stale telemetry - not recorded")
-    diag("refused", string.format("stale age=%dms limit=%ss peak=%s via=%s",
-      age, tostring(S.cfg.stale), peakTxt, via))
+    if age < 0 then
+      core.setStatus("no telemetry link - not recorded")
+      diag("refused", string.format("nolink age=-1ms peak=%s via=%s", peakTxt, via))
+    else
+      core.setStatus("stale telemetry - not recorded")
+      diag("refused", string.format("stale age=%dms limit=%ss peak=%s via=%s",
+        age, tostring(S.cfg.stale), peakTxt, via))
+    end
     return
   end
 
@@ -1946,9 +1993,12 @@ local function pollLaunchCycle()
   local inLZ  = (fm == FM_LAUNCH or fm == FM_ZOOM)
   local wasLZ = (prev == FM_LAUNCH or prev == FM_ZOOM)
   if fm == FM_LAUNCH and prev ~= FM_LAUNCH then
-    S.launchSeen = true
-    S.captured   = false
-    S.captureAt  = nil
+    S.launchSeen    = true
+    S.captured      = false
+    S.captureAt     = nil
+    S.captureWaited = false
+    S.captureVia    = nil
+    S.lastLaunchAt  = os.time()
   elseif S.launchSeen and wasLZ and not inLZ then
     S.captureAt = os.time() + CAPTURE_DELAY_SEC
   elseif inLZ and S.captureAt then
@@ -1960,7 +2010,9 @@ local function pollScheduledCapture()
   if not S.captureAt or os.time() < S.captureAt then return end
   S.captureAt  = nil
   S.launchSeen = false
-  if not S.captured then captureThrow("fm") end
+  local via = S.captureVia or "fm"
+  S.captureVia = nil
+  if not S.captured then captureThrow(via) end
 end
 
 -- Rising-edge detection shared by both assignable switches: level is ignored,
@@ -2104,10 +2156,28 @@ function core.wakeup()
     return
   end
   if not identityStillCurrent() then
+    -- In-place model switch on the radio (no restart): rebind the glider
+    -- and swap its data, settings and RX source. Logged like a boot so a
+    -- field session's diag.csv shows which plane the widget was on and
+    -- what it resolved -- field-verified 2026-09-15 that settings and RX
+    -- source do follow the switch (harness "in-place model switch").
     local fresh = bindIdentity()
     loadIdentityData(fresh)
     core.resolveRxSource()
     core.captureSetupBaseline()
+    -- The template's logic switches re-initialise on a model switch and
+    -- fire the same ALT_CALL pulse they fire ~3 s after boot (seen twice
+    -- in the 2026-09-15 log, refused only because telemetry happened to
+    -- be down). With the plane already on it would read the previous
+    -- flight's peak as a throw on the newly selected plane -- so the
+    -- boot ignore window restarts here, and any half-finished launch
+    -- cycle from the other model is dropped.
+    S.bootAt = os.time()
+    S.prevFM, S.launchSeen, S.captured, S.captureAt = nil, false, false, nil
+    S.captureWaited, S.captureVia, S.lastLaunchAt = false, nil, nil
+    diag("model", string.format("%s %s%s %s stale=%s floor=%s",
+      S.name or "?", S.modelId or "?", fresh and " (new)" or "",
+      sourcesSummary(), tostring(S.cfg.stale), tostring(S.cfg.floor)))
   end
 
   -- Defensive re-resolution for EVERY source resolveSources() sets, not
@@ -2164,7 +2234,7 @@ function core.wakeup()
   -- comes back with how long it was gone. With the stale gate off
   -- (cfg.stale = 0) telemetryLive is always true and nothing is logged.
   if S.altSrc then
-    if core.telemetryLive() then
+    if core.telemetryLive() or inResetGrace() then
       if S.telemLostLogged then
         diag("telem_back", string.format("after=%ds", os.time() - S.telemStaleAt))
         S.telemLostLogged = false

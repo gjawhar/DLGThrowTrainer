@@ -216,6 +216,20 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
   at power-on). Launch mode = launch button held, and that button also
   resets the altitude sensor (SF11), so a bench press reads ~0 and is
   refused as below floor -- same as the radio's own "zero" callout.
+- **Post-launch sensor reset window** (RESET_WAIT_SEC / RESET_GRACE_SEC in
+  core.lua): SF11 resets the Altitude sensor on the launch button and its
+  `age()` reads -1 for 3-5 s afterwards even though packets arrive (every
+  throw in the 2026-09-13/15 field logs shows the blip). captureThrow
+  defers once for RESET_WAIT_SEC when age is -1 within RESET_GRACE_SEC of
+  Launch; `inResetGrace()` also mutes the on-screen warning and the
+  telem_lost diag row in that window. `core.telemetryState()` = ok / none
+  (age -1, "no telemetry link") / stale -- screen.lua picks the wording.
+- **In-place model switch** (wakeup's identityStillCurrent branch) rebinds
+  the glider, reloads config, re-resolves the RX source, restarts the
+  boot ignore window (the template fires the ALT_CALL pulse on a model
+  switch too) and drops any launch cycle in progress. Writes a `model`
+  diag row. Harness "in-place model switch" covers settings/RX/identity
+  in both directions.
 - **Config persistence by NAME works where source objects don't**: the
   RX voltage sensor is stored as `cfg.rxSensor` (a string, default
   "RxBatt") and re-resolved via `system.getSource` at boot

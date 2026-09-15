@@ -431,6 +431,57 @@ if kr then
   check(app.V.screen == 1, "RTN (an EVT_KEY event) still works (screen=" .. app.V.screen .. ")")
 end
 
+print("\n-- in-place model switch (no restart): settings, RX source and identity follow the model")
+local idsA = { 0, 1 }
+core.setRxSensor("AN1"); core.S.cfg.floor = 40; core.saveConfig(); tick()
+check(sawText("RX 4.10V"), "plane A: RX source AN1, floor 40 saved")
+local gidA = core.S.gid
+model.id = function() return { 30, 61 } end   -- pilot switches models on the radio
+model.name = function() return "WHIP TAIL" end
+tick()
+check(core.S.gid ~= gidA, "switch: new glider bound in place (" .. tostring(core.S.gid) .. ")")
+check(core.S.cfg.floor ~= 40, "switch: plane B gets its own floor (" .. tostring(core.S.cfg.floor) .. "), not plane A's 40")
+check(core.rxSensorName() == "RxBatt" and sawText("RX 7.90V"), "switch: plane B RX source is its own default RxBatt (" .. core.rxSensorName() .. ")")
+check(diagHas("model", "WHIP TAIL"), "diag: model-switch row written")
+core.S.cfg.floor = 33; core.saveConfig()
+model.id = function() return idsA end; model.name = function() return "DLG V220X" end
+tick()
+check(core.S.gid == gidA, "switch back: plane A identity restored")
+check(core.S.cfg.floor == 40 and core.rxSensorName() == "AN1" and sawText("RX 4.10V"), "switch back: plane A floor 40 + RX AN1 restored (floor=" .. tostring(core.S.cfg.floor) .. " rx=" .. core.rxSensorName() .. ")")
+model.id = function() return { 30, 61 } end; model.name = function() return "WHIP TAIL" end; tick()
+check(core.S.cfg.floor == 33, "switch again: plane B remembers its own floor 33")
+model.id = function() return idsA end; model.name = function() return "DLG V220X" end; tick()
+core.setRxSensor(nil); core.S.cfg.floor = floorWas; core.saveConfig(); tick()
+
+print("\n-- model switch fires the template's callout pulse: ignored for 10 s, launch state dropped")
+model.id = function() return { 30, 61 } end; model.name = function() return "WHIP TAIL" end; tick()
+local nB = #core.S.launches
+SIM.altPeak = 95; SIM.call = 100; tick(); SIM.call = -100; tick()
+check(#core.S.launches == nB and lastDiag()[3] == "ignored", "callout pulse right after a model switch is ignored (" .. tostring(lastDiag()[4]) .. ")")
+tOff = tOff + 11; tick()
+model.id = function() return idsA end; model.name = function() return "DLG V220X" end; tick()
+tOff = tOff + 11; tick()
+
+print("\n-- sensor reset after the launch button: wait for the first packet instead of refusing")
+local nC = #core.S.launches
+SIM.fm = 2; tick(); SIM.fm = 3; tick(); SIM.fm = 0; SIM.altPeak = 80; SIM.altAge = -1; tick()
+tOff = tOff + 4; tick()
+check(#core.S.launches == nC and lastDiag()[3] == "wait", "age -1 just after launch -> wait row, no refusal (" .. tostring(lastDiag()[4]) .. ")")
+check(not core.telemetryWarning(), "no on-screen telemetry warning during the reset grace")
+SIM.altAge = 100; tOff = tOff + 2; tick()
+check(#core.S.launches == nC + 1 and core.S.launches[#core.S.launches].h == 80, "first packet arrives -> throw recorded after the wait")
+check((lastDiag()[4] or ""):find("via=fm", 1, true), "diag: deferred capture keeps its trigger name")
+core.undo()
+SIM.fm = 2; tick(); SIM.fm = 3; tick(); SIM.fm = 0; SIM.altPeak = 70; SIM.altAge = -1; tick()
+tOff = tOff + 4; tick(); tOff = tOff + 3; tick()
+check(#core.S.launches == nC and lastDiag()[3] == "refused" and (lastDiag()[4] or ""):find("nolink", 1, true), "still -1 after the wait -> refused as no link (" .. tostring(lastDiag()[4]) .. ")")
+check(sawText("no telemetry link"), "status says no telemetry link, not stale")
+tOff = tOff + 11; tick(); tOff = tOff + 4; tick()   -- past the reset grace, then past the 3 s warning dwell
+check(core.telemetryState() == "none" and sawText("no telemetry link"), "main warning line says no telemetry link when never received")
+SIM.altAge = 5000; tick(); tOff = tOff + 4; tick()
+check(core.telemetryState() == "stale" and sawText("stale telemetry"), "main warning line says stale telemetry when data stopped")
+SIM.altAge = 100; tick()
+
 print("\n-- small layout")
 drawn = {}; app.paint(640, 360); app.V.screen = 2; app.paint(640, 360); app.V.screen = 4; app.paint(640, 360)
 app.V.screen = 1
