@@ -8,6 +8,11 @@ Shellim's "DLG for Ethos" template and helps a DLG pilot tell whether a
 setup change (camber, trim, ballast, rudder offset) actually helped, or
 whether the difference is just throw-to-throw noise.
 
+![Throw Trainer main screen on an X14: last launch, comparison panel and the bar strip of recent throws](docs/main-screen.png)
+
+*The main screen as it looks on a fresh install, showing the built-in demo
+data. It clears itself on your first real throw.*
+
 ## What the widget shows
 
 - The height of your last launch, and how it compares to your previous set.
@@ -78,6 +83,11 @@ press or switch flick elsewhere never affects it.
 
 When a setup change is detected mid-session the CHANGES screen opens by
 itself, and every throw returns you to the main screen.
+
+![CHANGES screen after adding reflex in Launch mode: the changed trim highlighted, with "Throw glider to confirm and mark the change"](docs/changes-screen.png)
+
+*The CHANGES screen just after adding reflex in Launch mode. The next throw
+confirms it as a mark.*
 
 ## What the widget needs from your model
 
