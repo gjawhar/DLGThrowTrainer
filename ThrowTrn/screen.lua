@@ -187,6 +187,17 @@ function screen.new(opts)
 
   self.fits = fits
 
+  -- "On screen right now": paint only runs for the page being displayed, so a
+  -- recent paint means the pilot can see the widget. FS1-FS4 are gated on
+  -- THIS, not on focus (pilot's decision 2026-09-17, both apps: "I want the FS
+  -- keys to work whenever the page is active"). Ethos drops a widget's focus
+  -- on every RTN press -- even one the widget handled -- and after ten idle
+  -- seconds (measured in the simulator with Nice Flight!), so focus-gated
+  -- keys kept going dead; "back is inaccessible" (2026-09-10) was the same
+  -- thing. A hidden page still ignores the switches, which was the original
+  -- worry behind the focus gate.
+  function self.visible() return V.lastPaint ~= nil and os.time() - V.lastPaint <= 2 end
+
   -- Soft-key identifiers stay the same internally (activate() switches on
   -- them, and switch-assignment mirrors the CHANGE key) -- only the printed
   -- label changed, so relabelling is purely cosmetic and touches nothing
@@ -328,7 +339,7 @@ function screen.new(opts)
     -- bottom, which used to force a top-to-bottom mental jump on every
     -- press. All 4 slots hold a real key as of 2.0 (MARK/REVIEW LOG/CFG/
     -- CHANGES, UNDO removed); see drawKeyRow for the rendering rules.
-    local live = (not opts.needsFocus) or (lcd.hasFocus and lcd.hasFocus())
+    local live = true       -- FS keys work whenever this page is showing, see self.visible
     local items = {}
     for i = 1, KEY_SLOTS do
       local id = V.keys[i]
@@ -558,7 +569,10 @@ function screen.new(opts)
     -- after ~10 idle seconds -- longer than a throw takes. drawKeyRow dims
     -- the keys to show that, and the hint below says so (pilot,
     -- 2026-09-10: "back is inaccessible" was exactly this).
-    local live = (not opts.needsFocus) or (lcd.hasFocus and lcd.hasFocus())
+    -- hasFocus = the wheel and ENTER reach us; the FS key row is live
+    -- regardless (see self.visible).
+    local hasFocus = (not opts.needsFocus) or (lcd.hasFocus and lcd.hasFocus())
+    local live = true
     local touch = isTouchCapable()
 
     -- The screen's own FS-aligned key row, same shape and rules as Main
@@ -607,12 +621,12 @@ function screen.new(opts)
     -- confirmed via CurveVarProbe/the official Ethos Lua docs.
     lcd.font(FONT_S)
     local hint
-    if not live then hint = "press ENTER to focus widget"
+    if not hasFocus then hint = "FS keys work  ENTER: use the wheel"
     elseif V.rudEdit then hint = "wheel: adjust rud offset  ENTER: done"
     elseif V.acceptArmed then hint = "ENTER again to accept"
     else hint = "wheel: select key  ENTER: press" end
     local hw = lcd.getTextSize(hint)
-    lcd.color((not live or V.rudEdit or V.acceptArmed) and p.armed or p.dim)
+    lcd.color((V.rudEdit or V.acceptArmed) and p.armed or p.dim)
     draw.textAt(w - pad - hw, y, hint)
     if fm == core.FM_LAUNCH or fm == core.FM_ZOOM then
       lcd.color(p.dim)
@@ -689,7 +703,7 @@ function screen.new(opts)
       if fmConst == core.FM_LAUNCH and rects[3] then
         local r = rects[3]
         V.setupRudRect = (touch and live) and r or nil
-        if live and (V.rudEdit or V.setupFocus == 4) then
+        if hasFocus and (V.rudEdit or V.setupFocus == 4) then
           lcd.color(V.rudEdit and p.armed or p.accent)
           lcd.drawRectangle(r.x - 2, r.y - 2, r.w + 4, r.h + 4, 2)
         end
@@ -1587,6 +1601,7 @@ function screen.new(opts)
 
   function self.paint(w, h)
     if V.inForm then return end
+    V.lastPaint = os.time()
     -- Drain the edge flag EVERY frame, regardless of which screen is
     -- showing -- not just while V.screen == MAIN. Confirmed real bug
     -- 2026-09-09 (X20RS touch test, pilot report: "no way to get back to

@@ -161,6 +161,18 @@ or find yourself reaching for a "standard Lua" idiom, check this list first.
     `self.event` acts on `TOUCH_END` only and consumes every other touch
     phase before any screen/form gate.
 
+## FS keys follow page visibility, not focus (2026-09-17)
+
+Pilot's decision for both Throw Trainer and Nice Flight!: FS1-FS4 act
+whenever the widget's page is ON SCREEN (`screen.visible()`: painted within
+the last 2 s), not only while it holds focus. Measured with Nice Flight! in
+the simulator: Ethos drops a widget's focus on EVERY RTN press, even one the
+widget's event() handled, and after about ten idle seconds, so focus-gated
+keys kept going dead ("back is inaccessible", 2026-09-10, was this). The
+original reason for the focus gate, a bumped FS acting on a hidden Throw
+Trainer, is still covered because a hidden page is not painted. Rotary and
+ENTER still need focus; that is Ethos, not us. Not yet run on hardware.
+
 ## Key design decisions worth preserving
 
 - **One injection seam.** `core.recordLaunch()` is the only way a throw

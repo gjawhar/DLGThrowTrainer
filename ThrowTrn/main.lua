@@ -95,15 +95,15 @@ local function widgetWakeup(widget)
   local ok, err = pcall(core.wakeup)
   if not ok then core.setStatus("wakeup error: " .. tostring(err)) end
 
-  -- Hardware FS1-FS4, mirroring the on-screen key row 1:1. None of them
-  -- act until THIS widget instance is confirmed to be the visible, focused
-  -- one on screen (pilot's explicit request, 2026-09) -- otherwise bumping
-  -- any of FS1-4 anywhere else in the radio would quietly act on Throw
-  -- Trainer even when nobody's looking at it. Polled every wakeup
-  -- regardless (core.pollFS does its own edge-detection so state doesn't go
-  -- stale while unfocused), but only acted on here.
+  -- Hardware FS1-FS4, mirroring the on-screen key row 1:1. They act whenever
+  -- this widget's page is the one ON SCREEN (screen.visible: painted in the
+  -- last two seconds), not only while it holds focus -- the pilot's decision
+  -- 2026-09-17 for both apps. The earlier focus gate (his request, 2026-09)
+  -- existed so a bumped FS switch could not act on a Throw Trainer nobody was
+  -- looking at; visibility covers that, without the keys going dead every
+  -- time Ethos takes focus away (each RTN press, and after ten idle seconds).
   local ok2, fs = pcall(core.pollFS)
-  if ok2 and fs and widget and widget.app and lcd.hasFocus and lcd.hasFocus()
+  if ok2 and fs and widget and widget.app and widget.app.visible()
      and widget.app.fits(lcd.getWindowSize()) then
     local ok3, err3 = pcall(widget.app.pressKey, fs)
     if not ok3 then core.setStatus("FS error: " .. tostring(err3)) end

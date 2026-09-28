@@ -506,5 +506,16 @@ drawn = {}; app.paint(640, 360); app.V.screen = 2; app.paint(640, 360); app.V.sc
 app.V.screen = 1
 check(true, "640x360 paints without error")
 
+print("\n-- FS keys follow page visibility, not focus (pilot's decision 2026-09-17)")
+lcd.hasFocus = function() return false end          -- Ethos took focus away (RTN, or ten idle seconds)
+drawn = {}; app.paint(640, 360)
+check(app.visible(), "a page painted just now counts as on screen, focused or not")
+app.pressKey(2)
+check(app.V.screen == 4, "FS2 opens Review Log without focus")
+app.V.screen = 1
+tOff = tOff + 5
+check(not app.visible(), "a page not painted for 5 s counts as hidden, so main.lua ignores FS1-4")
+lcd.hasFocus = function() return true end
+
 print(string.format("\n%s (%d failure%s)", failures == 0 and "ALL PASSED" or "FAILED", failures, failures == 1 and "" or "s"))
 os.exit(failures == 0 and 0 or 1)
