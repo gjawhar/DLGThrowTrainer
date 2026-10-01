@@ -151,35 +151,41 @@ physical switch).
 
 ## Installation
 
-### Install with Ethos Suite
+### Install with FrSky Suite
 
-1. Download the release ZIP (see the
-   [Releases page](https://github.com/gjawhar/DLGThrowTrainer/releases)) —
-   it's already shaped the way Ethos Suite expects, no repacking needed.
-2. In Ethos Suite, open the **Lua Library** tab.
-3. Choose **Install lua script** and select the ZIP file.
-4. Let Ethos Suite copy the script to the radio storage, then assign the
-   widget to a model screen at Full size, or the wide Half slot (it will
-   appear as "Throw Trainer" in the widget picker either way) and open its
-   Settings to configure the minimum height and confirm the height source
-   from the DLG template.
+1. Download the release ZIP from the
+   [Releases page](https://github.com/gjawhar/DLGThrowTrainer/releases). It
+   carries the `ethos_lua_manifest.json` that FrSky Suite's Lua installer
+   requires, so there is nothing to repack.
+2. In FrSky Suite, connect the radio, open the Lua page, choose **Install
+   Lua scripts** and select the ZIP.
+3. Reboot the radio, then assign the widget to a model screen at Full size,
+   or the wide Half slot (it appears as "Throw Trainer" in the widget picker
+   either way), and open its Settings to configure the minimum height and
+   confirm the height source from the DLG template.
 
-ZIP structure for Ethos Suite:
+Updating this way keeps your data: the installer only writes the code files
+listed in the manifest and never touches `Files/*.csv`.
+
+ZIP structure:
 
 ```
-scripts/
-└── ThrowTrn/
-    ├── main.lua
-    ├── core.lua
-    ├── draw.lua
-    ├── screen.lua
-    ├── config.lua
-    └── Files/
+ethos_lua_manifest.json
+ThrowTrn/
+├── main.lua
+├── core.lua
+├── draw.lua
+├── screen.lua
+├── config.lua
+└── Files/
 ```
 
 `Files/` must exist (even empty) because the widget stores
 `launches.csv`, `events.csv`, `gliders.csv`, `config.csv` and `diag.csv`
 there automatically as it runs.
+
+Build it with `python3 tools/make_zip.py`, which also checks the result
+against FrSky Suite's rules.
 
 ### Diagnostics
 
