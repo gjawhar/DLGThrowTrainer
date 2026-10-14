@@ -359,3 +359,18 @@ check these"):**
 - Behavior when the DLG model is cloned (new receiver number) — the
   identity-binding design handles this in theory (see `bindIdentity()`
   comments) but hasn't been bench-tested with an actual clone.
+
+## Ethos caps a callback's Lua instructions (2.1.1, 2026-10-14)
+
+Ethos aborts any single callback (paint, wakeup, ...) that runs past an
+instruction budget, with "Max instructions count reached" (added in Ethos
+1.5.3 as infinite-loop protection; Rotorflight measured about 20k VM
+instructions per callback). A pilot's X20 hit it in paintMain with 128
+throws in 39 sets (plus 30 empty power-cycle groups): `core.stats`,
+`core.strip` x2, `isArmed`, `beforeGroup` each rescanned every launch,
+~36k instructions a frame. Fix: one cached pass (`index()` in core.lua,
+keyed on the log's shape plus `core.touch()`), `core.stats` cached with it.
+Main paint on that data: 36k -> 10.8k. The harness counts instructions
+with `debug.sethook` on a 40-set log and fails above 12k for main and 40k
+for all four screens. Never read a file or scan the whole log inside a
+paint; measure any new screen the same way before shipping.

@@ -4,7 +4,7 @@
 
 local core = {}
 
-core.VERSION = "2.1.0"
+core.VERSION = "2.1.1"
 
 -- ---------------------------------------------------------------- constants
 
@@ -693,6 +693,7 @@ end
 
 local function loadLog()
   S.launches, S.events = {}, {}
+  core.touch()
   local gid = core.activeGid()
 
   local rows = readRows("launches")
@@ -746,24 +747,64 @@ end
 
 -- ---------------------------------------------------------------- grouping
 
-function core.currentGroup()
-  local g = 1
-  for i = 1, #S.launches do
-    if S.launches[i].grp > g then g = S.launches[i].grp end
-  end
-  for i = 1, #S.events do
-    if S.events[i].grp > g then g = S.events[i].grp end
-  end
-  return g
+-- Every event kind that opens a real current/previous-set boundary --
+-- everything except "power". "setup" (auto-detected), "revert" and
+-- "accept" count exactly like a manual "change" here, so the delta
+-- badge's fallback-to-recent-window logic (core.stats) must not fire just
+-- because the only boundary so far wasn't key-pressed.
+local function isMark(e)
+  local t = e.type
+  return t == "change" or t == "setup" or t == "revert" or t == "accept"
 end
 
-local function countIn(grp)
-  local n = 0
-  for i = 1, #S.launches do
-    if S.launches[i].grp == grp then n = n + 1 end
-  end
-  return n
+-- Flagged records are excluded from every average, per S7.
+local function valid(rec) return rec.st == "ok" end
+
+-- ONE pass over the log, cached until the log changes: current group, per
+-- group counts and valid heights, every valid height, lifetime best, and
+-- whether any mark exists. Before this each of those was its own scan and
+-- a main-screen paint ran a dozen of them; with a season of throws that
+-- crossed Ethos's per-callback instruction budget ("Max instructions
+-- count reached", a pilot's X20, 2026-10-13) and blanked the screen. The
+-- key covers every edit the app makes; core.touch() is for the rest.
+local function revKey()
+  local nl, ne = #S.launches, #S.events
+  local l, e = S.launches[nl], S.events[ne]
+  return table.concat({ nl, ne, l and l.grp or 0, l and l.st or "", l and l.h or 0,
+                        e and e.grp or 0, e and e.type or "", S.baselineGrp or 0, S.rev or 0 }, "/")
 end
+function core.touch() S.rev = (S.rev or 0) + 1 end
+
+local function index()
+  local key = revKey()
+  local I = S.index
+  if I and I.key == key then return I end
+  I = { key = key, cur = 1, nAll = {}, counts = {}, heights = {}, all = {}, best = nil, hasChange = false }
+  for i = 1, #S.launches do
+    local r = S.launches[i]
+    if r.grp > I.cur then I.cur = r.grp end
+    I.nAll[r.grp] = (I.nAll[r.grp] or 0) + 1
+    if valid(r) then
+      I.counts[r.grp] = (I.counts[r.grp] or 0) + 1
+      local h = I.heights[r.grp]
+      if not h then h = {}; I.heights[r.grp] = h end
+      h[#h + 1] = r.h
+      I.all[#I.all + 1] = r.h
+      if not I.best or r.h > I.best then I.best = r.h end
+    end
+  end
+  for i = 1, #S.events do
+    local e = S.events[i]
+    if e.grp > I.cur then I.cur = e.grp end
+    if isMark(e) then I.hasChange = true end
+  end
+  S.index, S.statsCache = I, nil
+  return I
+end
+
+function core.currentGroup() return index().cur end
+
+local function countIn(grp) return index().nAll[grp] or 0 end
 
 function core.lastEvent()
   if #S.events == 0 then return nil end
@@ -779,22 +820,7 @@ function core.isArmed()
   return e ~= nil and e.type == "change" and e.grp == cur
 end
 
--- Every event kind that opens a real current/previous-set boundary --
--- everything except "power". "setup" (auto-detected), "revert" and
--- "accept" count exactly like a manual "change" here, so the delta
--- badge's fallback-to-recent-window logic (core.stats) must not fire just
--- because the only boundary so far wasn't key-pressed.
-local function isMark(e)
-  local t = e.type
-  return t == "change" or t == "setup" or t == "revert" or t == "accept"
-end
-
-function core.hasChange()
-  for i = 1, #S.events do
-    if isMark(S.events[i]) then return true end
-  end
-  return false
-end
+function core.hasChange() return index().hasChange end
 
 -- ---------------------------------------------------------------- statistics
 
@@ -805,17 +831,9 @@ local function mean(list)
   return sum / #list
 end
 
--- Flagged records are excluded from every average, per S7.
-local function valid(rec) return rec.st == "ok" end
-
-local function heightsIn(grp)
-  local out = {}
-  for i = 1, #S.launches do
-    local r = S.launches[i]
-    if r.grp == grp and valid(r) then out[#out + 1] = r.h end
-  end
-  return out
-end
+-- Shared with the index: callers only read these lists.
+local EMPTY = {}
+local function heightsIn(grp) return index().heights[grp] or EMPTY end
 
 -- Average height of one specific group, flagged records excluded --
 -- exposed for Review Log's per-mark delta (this group's average vs the one
@@ -828,9 +846,9 @@ end
 -- The most recent closed group that actually holds data. A group emptied by
 -- undo is skipped rather than reported as an empty Before.
 function core.beforeGroup()
-  local cur = core.currentGroup()
-  for g = cur - 1, 1, -1 do
-    if #heightsIn(g) > 0 then return g end
+  local I = index()
+  for g = I.cur - 1, 1, -1 do
+    if (I.counts[g] or 0) > 0 then return g end
   end
   return nil
 end
@@ -855,8 +873,9 @@ function core.baselineGroup()
     end
   end
   if not firstMark then return nil end
+  local c = index().counts
   for g = firstMark - 1, 1, -1 do
-    if #heightsIn(g) > 0 then return g end
+    if (c[g] or 0) > 0 then return g end
   end
   return nil
 end
@@ -869,17 +888,23 @@ local function tail(list, n)
   return out
 end
 
-local function validHeights()
-  local out = {}
-  for i = 1, #S.launches do
-    if valid(S.launches[i]) then out[#out + 1] = S.launches[i].h end
-  end
-  return out
-end
+local function validHeights() return index().all end
 
 -- Everything the views need, computed in one place so the widget and the tool
--- can never disagree about a figure.
+-- can never disagree about a figure. Cached with the index: a paint asks
+-- for this several times and the answer only changes when the log does.
+local statsUncached
 function core.stats(barCount)
+  local I = index()
+  local key = tostring(barCount or 12) .. "/" .. tostring(S.cfg.window or 20) .. "/" .. tostring(S.unit)
+  local c = S.statsCache
+  if c and c.key == key and c.index == I then return c.st end
+  local st = statsUncached(barCount)
+  S.statsCache = { key = key, index = I, st = st }
+  return st
+end
+
+statsUncached = function(barCount)
   local cur = core.currentGroup()
   local bg  = core.beforeGroup()
   local after  = heightsIn(cur)
@@ -921,10 +946,7 @@ function core.stats(barCount)
     fallback  = false,
   }
 
-  st.best = nil
-  for i = 1, #all do
-    if not st.best or all[i] > st.best then st.best = all[i] end
-  end
+  st.best = index().best
 
   -- Best within the current (open) set, for the "avg .. best .." context
   -- line under the hero number -- distinct from the lifetime best above.
@@ -1292,6 +1314,7 @@ function core.undo()
   local t = core.undoTarget()
   if not t then return false end
   local gid = core.activeGid()
+  core.touch()
 
   if t.kind == "launch" then
     table.remove(S.launches)

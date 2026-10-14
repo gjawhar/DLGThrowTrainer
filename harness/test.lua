@@ -517,5 +517,35 @@ tOff = tOff + 5
 check(not app.visible(), "a page not painted for 5 s counts as hidden, so main.lua ignores FS1-4")
 lcd.hasFocus = function() return true end
 
+-- A season's worth of data must paint within Ethos's instruction budget.
+-- 40 sets of 11 throws (as on a pilot's X20 that hit "Max instructions
+-- count reached" with 2.1.0): count VM instructions for one main paint.
+print("\n-- paint cost with 40 sets / 440 throws")
+do
+  core.erase()
+  for g = 1, 40 do
+    for _ = 1, 11 do throw(100 + g) end
+    if g < 40 then core.change() end
+  end
+  check(core.currentGroup() == 40 and #core.S.launches == 440, "440 throws in 40 sets (" .. tostring(core.currentGroup()) .. ", " .. tostring(#core.S.launches) .. ")")
+  app.V.screen = 1
+  local count = 0
+  debug.sethook(function() count = count + 1 end, "", 100)
+  drawn = {}; app.paint(800, 480)
+  debug.sethook()
+  local instr = count * 100
+  check(instr < 12000, "one main-screen paint under 12k VM instructions, well inside Ethos's budget (" .. tostring(instr) .. ")")
+  -- a season of power cycles: 30 empty groups above the data (as on the pilot's X20)
+  for g = 41, 70 do core.S.events[#core.S.events + 1] = { ts = os.time(), type = "power", grp = g, seq = 9000 + g } end
+  core.touch()
+  check(core.currentGroup() == 70 and core.beforeGroup() == 40, "empty power-cycle groups skipped to the last set with throws")
+  count = 0
+  debug.sethook(function() count = count + 1 end, "", 100)
+  for scr = 1, 4 do app.V.screen = scr; drawn = {}; app.paint(800, 480) end
+  debug.sethook()
+  check(count * 100 < 40000, "all four screens painted once under 40k instructions in total (" .. tostring(count * 100) .. ")")
+  app.V.screen = 1
+end
+
 print(string.format("\n%s (%d failure%s)", failures == 0 and "ALL PASSED" or "FAILED", failures, failures == 1 and "" or "s"))
 os.exit(failures == 0 and 0 or 1)
