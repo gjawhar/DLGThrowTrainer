@@ -119,20 +119,20 @@ function config.build(onErase, onDone)
   end })
 
   -- About ------------------------------------------------------------------
-  panel = form.addExpansionPanel("About")
+  -- Version in the title so it reads without opening; rows are text
+  -- buttons (press does nothing) because static text cannot take focus and
+  -- an Ethos form only scrolls to follow focus -- on a short screen the
+  -- opened panel's rows were unreachable (pilot, Twin X Lite, 2026-11-11).
+  panel = form.addExpansionPanel("About - Throw Trainer " .. core.VERSION)
   panel:open(false)
-
-  line = panel:addLine("Version")
-  form.addStaticText(line, nil, core.VERSION)
-
-  line = panel:addLine("Glider")
-  form.addStaticText(line, nil, core.S.name)
-
-  line = panel:addLine("Units")
-  form.addStaticText(line, nil, core.S.unit .. " (from sensor)")
-
-  line = panel:addLine("Storage")
-  form.addStaticText(line, nil, core.S.dir or "unavailable")
+  local function info(label, text)
+    line = panel:addLine(label)
+    form.addTextButton(line, nil, tostring(text), function() return true end)
+  end
+  info("Version", core.VERSION)
+  info("Glider", core.S.name)
+  info("Units", core.S.unit .. " (from sensor)")
+  info("Storage", core.S.dir or "unavailable")
 
   if onDone then onDone() end
 end
